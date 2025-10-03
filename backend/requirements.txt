@@ -1,0 +1,19 @@
+# FastAPI and Server
+fastapi[all]
+uvicorn
+
+# Database
+beanie
+motor
+python-dotenv
+
+# Authentication
+fastapi-users[beanie]
+python-jose[cryptography]
+passlib[bcrypt]
+
+#Blog
+python-multipart
+cloudinary
+slugify
+python-slugify

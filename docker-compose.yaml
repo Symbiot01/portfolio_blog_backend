@@ -1,0 +1,16 @@
+# This file only defines our database service.
+services:
+  mongo:
+    image: mongo:latest
+    container_name: mongodb
+    ports:
+      # This is the crucial line: it maps the container's port 27017
+      # to your local machine's port 27017.
+      - "27017:27017"
+    volumes:
+      # This ensures your data is saved even if the container is removed.
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+volumes:
+  mongo-data:

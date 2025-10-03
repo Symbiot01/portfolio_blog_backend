@@ -1,0 +1,707 @@
+======== FILE: ./main.py ========
+# main.py
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, Request # <-- 1. Import Request
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+from app.blog.router import router as blog_router
+from app.auth.router import router as auth_router
+from app.uploads.router import router as uploads_router
+from app.admin.router import router as admin_router
+from app.core.database import initialize_database
+
+limiter = Limiter(key_func=get_remote_address)
+
+app = FastAPI(
+    title="Portfolio & Blog API",
+    version="1.0.0"
+)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+origins = ["*"] 
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def on_startup():
+    await initialize_database()
+
+app.include_router(auth_router, prefix="/api/auth")
+app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
+app.include_router(blog_router, prefix="/api/blog", tags=["Blog"])
+app.include_router(uploads_router, prefix="/api/uploads", tags=["Uploads"])
+
+@app.get("/api/health")
+@limiter.limit("5/minute")
+# 2. Add the request argument to the function signature
+def health_check(request: Request):
+    return {"status": "ok", "message": f"Connected to DB: {os.getenv('DATABASE_NAME')}"}
+
+
+======== FILE: ./app/blog/schemas.py ========
+# app/blog/schemas.py
+from pydantic import BaseModel, Field
+from beanie import PydanticObjectId
+from typing import Optional, List
+from datetime import datetime
+from app.auth.schemas import UserRead
+
+# A schema to represent the author's public information
+class AuthorRead(BaseModel):
+    id: PydanticObjectId
+    username: str
+
+# Schema for creating a new blog post
+class BlogPostCreate(BaseModel):
+    title: str = Field(..., max_length=100)
+    cover_image_url: Optional[str] = None   
+    content: str
+    excerpt: Optional[str] = Field(default=None, max_length=300)
+    tags: Optional[List[str]] = []
+
+# Schema for reading a blog post (what the API returns)
+class BlogPostRead(BaseModel):
+    id: PydanticObjectId
+    title: str
+    slug: str
+    cover_image_url: Optional[str]
+    content: str
+    excerpt: Optional[str]
+    author: AuthorRead
+    likes_count: int = 0
+    status: str
+    tags: Optional[List[str]]
+    createdAt: datetime
+
+# Schema for reading a simplified list of posts
+class BlogPostList(BaseModel):
+    id: PydanticObjectId
+    title: str
+    slug: str
+    cover_image_url: Optional[str]
+    excerpt: Optional[str]
+    author: AuthorRead
+    likes_count: int = 0
+    tags: Optional[List[str]]
+    createdAt: datetime
+
+
+    # --- ADD THESE NEW SCHEMAS ---
+
+# Schema for creating a new comment
+class CommentCreate(BaseModel):
+    content: str = Field(..., max_length=1000)
+
+# Schema for reading a comment (what the API returns)
+class CommentRead(BaseModel):
+    id: PydanticObjectId
+    author: UserRead # Use the existing UserRead to show author details
+    content: str
+    createdAt: datetime
+
+
+======== FILE: ./app/blog/__init__.py ========
+
+
+
+======== FILE: ./app/blog/router.py ========
+# app/blog/router.py
+from fastapi import APIRouter, Depends, HTTPException
+from typing import List
+from beanie import PydanticObjectId
+
+from app.models.blog_post import BlogPost, PostStatus
+from app.models.user import User
+from app.auth.core import current_active_user
+from app.blog.schemas import (
+    BlogPostCreate, BlogPostRead, BlogPostList,
+    CommentCreate, CommentRead, UserRead
+)
+from app.blog.service import BlogService
+from app.models.comment import Comment
+
+router = APIRouter()
+
+# --- Post Endpoints ---
+
+@router.get("/posts", response_model=List[BlogPostList])
+async def get_all_posts(skip: int = 0, limit: int = 10):
+    posts_from_db = await BlogPost.find(
+        BlogPost.status == PostStatus.PUBLISHED, fetch_links=True
+    ).sort(-BlogPost.createdAt).skip(skip).limit(limit).to_list()
+
+    return [
+        BlogPostList(
+            **post.dict(),
+            author={"id": post.author.id, "username": post.author.username},
+            likes_count=len(post.likes)
+        ) for post in posts_from_db
+    ]
+
+@router.post("/posts", response_model=BlogPostRead, status_code=201)
+async def submit_post(post_data: BlogPostCreate, user: User = Depends(current_active_user)):
+    try:
+        new_post = await BlogService.create_post(post_data, user)
+        return BlogPostRead.from_db_model(new_post)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.get("/posts/{slug}", response_model=BlogPostRead)
+async def get_post_by_slug(slug: str):
+    post = await BlogPost.find_one(
+        BlogPost.slug == slug, BlogPost.status == PostStatus.PUBLISHED, fetch_links=True
+    )
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return BlogPostRead.from_db_model(post)
+
+@router.post("/posts/{post_id}/like", response_model=BlogPostRead)
+async def like_a_post(post_id: PydanticObjectId, user: User = Depends(current_active_user)):
+    updated_post = await BlogService.like_post(post_id, user)
+    if not updated_post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return BlogPostRead.from_db_model(updated_post)
+
+# --- Comment Endpoints ---
+
+@router.post("/posts/{post_id}/comments", response_model=CommentRead, status_code=201)
+async def create_comment(post_id: PydanticObjectId, comment_data: CommentCreate, user: User = Depends(current_active_user)):
+    post = await BlogPost.get(post_id)
+    if not post or post.status != PostStatus.PUBLISHED:
+        raise HTTPException(status_code=404, detail="Post not found or not published")
+    
+    comment = Comment(post=post, author=user, content=comment_data.content)
+    await comment.insert()
+    return CommentRead.from_db_model(comment)
+
+@router.get("/posts/{post_id}/comments", response_model=List[CommentRead])
+async def get_comments(post_id: PydanticObjectId, skip: int = 0, limit: int = 20):
+    comments = await Comment.find(
+        Comment.post.id == post_id, fetch_links=True
+    ).sort(-Comment.createdAt).skip(skip).limit(limit).to_list()
+    
+    return [CommentRead.from_db_model(comment) for comment in comments]
+
+
+======== FILE: ./app/blog/service.py ========
+# app/blog/service.py
+from slugify import slugify
+from beanie import PydanticObjectId
+
+from app.models.blog_post import BlogPost, PostStatus
+from app.models.user import User, Role
+from app.blog.schemas import BlogPostCreate
+
+class BlogService:
+    @staticmethod
+    async def create_post(post_data: BlogPostCreate, current_user: User) -> BlogPost:
+        slug = slugify(post_data.title)
+        
+        # Check if a post with this slug already exists
+        existing_post = await BlogPost.find_one(BlogPost.slug == slug)
+        if existing_post:
+            # You might want to append a unique ID or handle this differently
+            raise ValueError("A post with this title already exists.")
+
+        # Your "review" logic is implemented here!
+        status = PostStatus.PUBLISHED if current_user.role == Role.ADMIN else PostStatus.PENDING_REVIEW
+
+        post = BlogPost(
+            **post_data.dict(),
+            slug=slug,
+            author=current_user,
+            status=status
+        )
+        return await post.insert()
+
+    @staticmethod
+    async def like_post(post_id: PydanticObjectId, current_user: User):
+        post = await BlogPost.get(post_id, fetch_links=True)
+        if not post:
+            return None # Or raise an exception
+
+        # Check if user has already liked the post
+        user_already_liked = any(liked_user.id == current_user.id for liked_user in post.likes)
+
+        if user_already_liked:
+            # Unlike the post
+            post.likes = [user for user in post.likes if user.id != current_user.id]
+        else:
+            # Like the post
+            post.likes.append(current_user)
+        
+        await post.save()
+        return post
+
+
+======== FILE: ./app/auth/schemas.py ========
+from fastapi_users import schemas
+from beanie import PydanticObjectId
+from typing import Optional
+
+class UserRead(schemas.BaseUser[PydanticObjectId]):
+    username: str
+    avatar: Optional[str] = None
+    bio: Optional[str] = None
+    role: str
+
+class UserCreate(schemas.BaseUserCreate):
+    username: str
+
+
+======== FILE: ./app/auth/core.py ========
+# app/auth/core.py
+from fastapi_users import FastAPIUsers
+from beanie import PydanticObjectId  # <-- CORRECTED: Import from beanie
+from app.models.user import User      # <-- User is still imported from here
+from app.auth.backend import auth_backend
+from app.auth.manager import get_user_manager
+
+# This is the central object that ties everything together
+fastapi_users = FastAPIUsers[User, PydanticObjectId](
+    get_user_manager,
+    [auth_backend],
+)
+
+# This is a dependency that can be used in your own API endpoints to get the current user
+current_active_user = fastapi_users.current_user(active=True)
+
+
+======== FILE: ./app/auth/manager.py ========
+# app/auth/manager.py
+import os
+from typing import Optional
+from beanie import PydanticObjectId
+from fastapi import Depends, Request
+from fastapi_users import BaseUserManager, exceptions, models, schemas
+from fastapi_users.db import BeanieUserDatabase
+from app.models.user import User
+from app.auth.db import get_user_db
+
+SECRET = os.getenv("SECRET_KEY")
+
+class UserManager(BaseUserManager[User, PydanticObjectId]):
+    reset_password_token_secret = SECRET
+    verification_token_secret = SECRET
+
+
+    def parse_id(self, id: str) -> PydanticObjectId:
+        return PydanticObjectId(id)
+
+    async def on_after_register(self, user: User, request: Optional[Request] = None):
+        print(f"User {user.id} has registered.")
+
+    async def create(
+        self,
+        user_create: schemas.UC,
+        safe: bool = False,
+        request: Optional[Request] = None,
+    ) -> models.UP:
+        await self.validate_password(user_create.password, user_create)
+
+        existing_user_by_email = await self.user_db.get_by_email(user_create.email)
+        if existing_user_by_email is not None:
+            raise exceptions.UserAlreadyExists()
+
+        existing_user_by_username = await self.user_db.user_model.find_one(
+            self.user_db.user_model.username == user_create.username
+        )
+        
+        if existing_user_by_username is not None:
+            raise exceptions.UserAlreadyExists()
+
+        user_dict = user_create.create_update_dict()
+        password = user_dict.pop("password")
+        user_dict["hashed_password"] = self.password_helper.hash(password)
+        
+        created_user = await self.user_db.create(user_dict)
+
+        await self.on_after_register(created_user, request)
+
+        return created_user
+
+async def get_user_manager(user_db: BeanieUserDatabase = Depends(get_user_db)):
+    yield UserManager(user_db)
+
+
+======== FILE: ./app/auth/__init__.py ========
+
+
+
+======== FILE: ./app/auth/backend.py ========
+# app/auth/backend.py
+import os
+from fastapi_users.authentication import (
+    AuthenticationBackend,
+    BearerTransport,
+    JWTStrategy,
+)
+
+SECRET = os.getenv("SECRET_KEY")
+
+# This URL tells the frontend where to send the username and password for login
+bearer_transport = BearerTransport(tokenUrl="api/auth/jwt/login")
+
+def get_jwt_strategy() -> JWTStrategy:
+    """Returns the JWT strategy instance configured with our secret key."""
+    return JWTStrategy(secret=SECRET, lifetime_seconds=3600)
+
+# This is the main authentication object that fastapi-users will use
+auth_backend = AuthenticationBackend(
+    name="jwt",
+    transport=bearer_transport,
+    get_strategy=get_jwt_strategy,
+)
+
+
+======== FILE: ./app/auth/router.py ========
+# app/auth/router.py
+from fastapi import APIRouter
+from app.auth.core import fastapi_users
+from app.auth.schemas import UserRead, UserCreate
+from app.auth.backend import auth_backend
+
+# Create a single router to combine all auth routes
+router = APIRouter()
+
+# Router for JWT login/logout
+router.include_router(
+    fastapi_users.get_auth_router(auth_backend),
+    prefix="/jwt",
+    tags=["Auth"],
+)
+# Router for registration
+router.include_router(
+    fastapi_users.get_register_router(UserRead, UserCreate),
+    tags=["Auth"],
+)
+# Router for user management (e.g., get /me)
+router.include_router(
+    fastapi_users.get_users_router(UserRead, UserRead),
+    prefix="/users",
+    tags=["Users"],
+)
+
+
+======== FILE: ./app/auth/db.py ========
+from fastapi_users.db import BeanieUserDatabase
+from app.models.user import User
+
+async def get_user_db():
+    yield BeanieUserDatabase(User)
+
+
+======== FILE: ./app/auth/guards.py ========
+# app/auth/guards.py
+from fastapi import Depends, HTTPException, status
+from app.models.user import User, Role
+from app.auth.core import current_active_user
+
+# This is a dependency that can be used on any endpoint
+def admin_guard(user: User = Depends(current_active_user)):
+    """
+    A dependency that raises an HTTPException if the current user
+    is not an admin.
+    """
+    if user.role != Role.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to perform this action."
+        )
+    return user # Optionally return the user object
+
+
+======== FILE: ./app/__init__.py ========
+
+
+
+======== FILE: ./app/core/__init__.py ========
+
+
+
+======== FILE: ./app/core/database.py ========
+import os
+import motor.motor_asyncio
+from beanie import init_beanie
+from app.models.user import User
+from app.models.blog_post import BlogPost
+from app.models.comment import Comment
+
+async def initialize_database():
+    """Initializes the Beanie ODM and connects to the database."""
+    client = motor.motor_asyncio.AsyncIOMotorClient(os.getenv("DATABASE_URL"))
+    db_name = os.getenv("DATABASE_NAME")
+    
+    await init_beanie(
+        database=client.get_database(db_name),
+        document_models=[
+            User,
+            BlogPost,
+            Comment,
+        ]
+    )
+
+
+======== FILE: ./app/admin/__init__.py ========
+
+
+
+======== FILE: ./app/admin/router.py ========
+# app/admin/router.py
+from fastapi import APIRouter, Depends, HTTPException
+from typing import List
+from beanie import PydanticObjectId
+
+from app.models.blog_post import BlogPost, PostStatus
+from app.models.comment import Comment
+from app.auth.guards import admin_guard
+from app.blog.schemas import BlogPostRead # Reuse existing schemas
+
+router = APIRouter()
+
+# --- Post Management ---
+
+@router.get("/posts/pending", response_model=List[BlogPostRead], dependencies=[Depends(admin_guard)])
+async def get_pending_posts():
+    """Get all posts that are pending review."""
+    posts = await BlogPost.find(
+        BlogPost.status == PostStatus.PENDING_REVIEW, fetch_links=True
+    ).sort(-BlogPost.createdAt).to_list()
+
+    # --- THIS IS THE FIX ---
+    # Explicitly construct the response to avoid the 'author' collision.
+    response_posts = []
+    for post in posts:
+        response_posts.append(
+            BlogPostRead(
+                id=post.id,
+                title=post.title,
+                slug=post.slug,
+                content=post.content,
+                excerpt=post.excerpt,
+                cover_image_url=post.cover_image_url,
+                author={"id": post.author.id, "username": post.author.username},
+                likes_count=len(post.likes),
+                status=post.status.value,
+                tags=post.tags,
+                createdAt=post.createdAt
+            )
+        )
+    return response_posts
+    # --- END OF FIX ---
+
+@router.patch("/posts/{post_id}/status", response_model=BlogPostRead, dependencies=[Depends(admin_guard)])
+async def update_post_status(post_id: PydanticObjectId, status: PostStatus):
+    """Update a post's status (e.g., publish or reject)."""
+    post = await BlogPost.get(post_id, fetch_links=True)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    post.status = status
+    await post.save()
+
+    # --- THIS IS THE FIX (Applied here too) ---
+    return BlogPostRead(
+        id=post.id,
+        title=post.title,
+        slug=post.slug,
+        content=post.content,
+        excerpt=post.excerpt,
+        cover_image_url=post.cover_image_url,
+        author={"id": post.author.id, "username": post.author.username},
+        likes_count=len(post.likes),
+        status=post.status.value,
+        tags=post.tags,
+        createdAt=post.createdAt
+    )
+    # --- END OF FIX ---
+
+@router.delete("/posts/{post_id}", status_code=204, dependencies=[Depends(admin_guard)])
+async def delete_post(post_id: PydanticObjectId):
+    """Delete a blog post by its ID. This will also delete all associated comments."""
+    post = await BlogPost.get(post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    await Comment.find(Comment.post.id == post_id).delete()
+    
+    await post.delete()
+    return None
+
+# --- Comment Management ---
+@router.delete("/comments/{comment_id}", status_code=204, dependencies=[Depends(admin_guard)])
+async def delete_comment(comment_id: PydanticObjectId):
+    """Delete a comment by its ID."""
+    comment = await Comment.get(comment_id)
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    await comment.delete()
+    return None
+
+
+======== FILE: ./app/uploads/__init__.py ========
+
+
+
+======== FILE: ./app/uploads/router.py ========
+# app/uploads/router.py
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from app.auth.core import current_active_user
+from app.models.user import User
+from .service import UploadService
+
+router = APIRouter()
+
+@router.post("/image")
+async def upload_image(
+    file: UploadFile = File(...),
+    user: User = Depends(current_active_user) # Protect the endpoint
+):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image.")
+
+    try:
+        image_url = UploadService.upload_image(file)
+        return {"url": image_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload image: {str(e)}")
+
+
+======== FILE: ./app/uploads/service.py ========
+# app/uploads/service.py
+import cloudinary
+import cloudinary.uploader
+from fastapi import UploadFile
+import os
+
+# Cloudinary configuration is automatically read from the CLOUDINARY_URL env variable
+
+class UploadService:
+    @staticmethod
+    def upload_image(file: UploadFile):
+        # You can specify a folder in Cloudinary to keep things organized
+        upload_result = cloudinary.uploader.upload(
+            file.file,
+            folder="portfolio_blog"
+        )
+        return upload_result.get("secure_url")
+
+
+======== FILE: ./app/models/user.py ========
+# app/models/user.py
+from beanie import Document
+from pydantic import EmailStr
+from enum import Enum
+from fastapi_users.db import BeanieBaseUser
+from typing import Optional
+from pymongo import IndexModel
+from pymongo.collation import Collation # <-- 1. Import Collation
+
+class Role(str, Enum):
+    ADMIN = "admin"
+    AUTHOR = "author"
+
+class User(BeanieBaseUser, Document):
+    email: EmailStr
+    username: str
+    
+    googleId: Optional[str] = None
+    avatar: Optional[str] = None
+    bio: Optional[str] = None
+    role: Role = Role.AUTHOR
+
+    class Settings:
+        name = "users"
+        
+        # --- THIS IS THE FIX ---
+        # 2. We explicitly define the collation object that the library is looking for.
+        email_collation = Collation(locale="en", strength=2)
+        # --- END OF FIX ---
+
+        # We still keep the indexes list to ensure MongoDB creates them correctly.
+        indexes = [
+            IndexModel(
+                "email",
+                unique=True,
+                collation=email_collation # Use the collation object here
+            ),
+            IndexModel("username", unique=True),
+        ]
+
+
+======== FILE: ./app/models/__init__.py ========
+
+
+
+======== FILE: ./app/models/blog_post.py ========
+# app/models/blog_post.py
+from beanie import Document, Link, PydanticObjectId
+from pydantic import Field
+from typing import Optional, List
+from datetime import datetime
+from enum import Enum
+
+from app.models.user import User  # Import the User model for linking
+
+class PostStatus(str, Enum):
+    DRAFT = "draft"
+    PENDING_REVIEW = "pending_review"
+    PUBLISHED = "published"
+    REJECTED = "rejected"
+
+class BlogPost(Document):
+    title: str = Field(..., max_length=100)
+    slug: str = Field(..., unique=True)
+    content: str
+    cover_image_url: Optional[str] = None 
+    excerpt: Optional[str] = Field(default=None, max_length=300)
+    
+    author: Link[User]
+    likes: List[Link[User]] = []
+    
+    status: PostStatus = PostStatus.DRAFT
+    tags: Optional[List[str]] = []
+    
+    createdAt: datetime = Field(default_factory=datetime.utcnow)
+
+    class Settings:
+        name = "blog_posts"
+        # Create a text index on title and content for full-text search later
+        indexes = [
+            [("title", "text"), ("content", "text")]
+        ]
+
+
+======== FILE: ./app/models/comment.py ========
+# app/models/comment.py
+from beanie import Document, Link
+from pydantic import Field
+from datetime import datetime
+
+from app.models.blog_post import BlogPost
+from app.models.user import User
+
+class Comment(Document):
+    post: Link[BlogPost]
+    author: Link[User]
+    content: str = Field(..., max_length=1000)
+    createdAt: datetime = Field(default_factory=datetime.utcnow)
+
+    class Settings:
+        name = "comments"
+
+
