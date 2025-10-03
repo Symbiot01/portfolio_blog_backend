@@ -60,20 +60,21 @@ from typing import Optional, List
 from datetime import datetime
 from app.auth.schemas import UserRead
 
-# A schema to represent the author's public information
+# Import models for type hinting in helper methods
+from app.models.blog_post import BlogPost
+from app.models.comment import Comment
+
 class AuthorRead(BaseModel):
     id: PydanticObjectId
     username: str
 
-# Schema for creating a new blog post
 class BlogPostCreate(BaseModel):
     title: str = Field(..., max_length=100)
-    cover_image_url: Optional[str] = None   
+    cover_image_url: Optional[str] = None
     content: str
     excerpt: Optional[str] = Field(default=None, max_length=300)
     tags: Optional[List[str]] = []
 
-# Schema for reading a blog post (what the API returns)
 class BlogPostRead(BaseModel):
     id: PydanticObjectId
     title: str
@@ -87,7 +88,25 @@ class BlogPostRead(BaseModel):
     tags: Optional[List[str]]
     createdAt: datetime
 
-# Schema for reading a simplified list of posts
+    # --- THIS IS THE FIX ---
+    @classmethod
+    def from_db_model(cls, post: BlogPost) -> "BlogPostRead":
+        """Helper method to convert a DB model to this Pydantic schema."""
+        return cls(
+            id=post.id,
+            title=post.title,
+            slug=post.slug,
+            content=post.content,
+            excerpt=post.excerpt,
+            cover_image_url=post.cover_image_url,
+            author={"id": post.author.id, "username": post.author.username},
+            likes_count=len(post.likes),
+            status=post.status.value,
+            tags=post.tags,
+            createdAt=post.createdAt,
+        )
+    # --- END OF FIX ---
+
 class BlogPostList(BaseModel):
     id: PydanticObjectId
     title: str
@@ -99,19 +118,27 @@ class BlogPostList(BaseModel):
     tags: Optional[List[str]]
     createdAt: datetime
 
-
-    # --- ADD THESE NEW SCHEMAS ---
-
-# Schema for creating a new comment
 class CommentCreate(BaseModel):
     content: str = Field(..., max_length=1000)
 
-# Schema for reading a comment (what the API returns)
 class CommentRead(BaseModel):
     id: PydanticObjectId
-    author: UserRead # Use the existing UserRead to show author details
+    author: UserRead
     content: str
     createdAt: datetime
+
+    # --- THIS IS THE FIX (Applied here too) ---
+    @classmethod
+    def from_db_model(cls, comment: Comment) -> "CommentRead":
+        """Helper method to convert a DB model to this Pydantic schema."""
+        author_data = UserRead(**comment.author.dict(), role=comment.author.role.value)
+        return cls(
+            id=comment.id,
+            author=author_data,
+            content=comment.content,
+            createdAt=comment.createdAt,
+        )
+    # --- END OF FIX ---
 
 
 ======== FILE: ./app/blog/__init__.py ========
@@ -140,17 +167,30 @@ router = APIRouter()
 
 @router.get("/posts", response_model=List[BlogPostList])
 async def get_all_posts(skip: int = 0, limit: int = 10):
+    # Fetch full documents to avoid N+1 query problems
     posts_from_db = await BlogPost.find(
         BlogPost.status == PostStatus.PUBLISHED, fetch_links=True
     ).sort(-BlogPost.createdAt).skip(skip).limit(limit).to_list()
 
-    return [
-        BlogPostList(
-            **post.dict(),
-            author={"id": post.author.id, "username": post.author.username},
-            likes_count=len(post.likes)
-        ) for post in posts_from_db
-    ]
+    # --- THIS IS THE FIX ---
+    # Manually construct the response to ensure the correct shape and data
+    response_posts = []
+    for post in posts_from_db:
+        response_posts.append(
+            BlogPostList(
+                id=post.id,
+                title=post.title,
+                slug=post.slug,
+                excerpt=post.excerpt,
+                cover_image_url=post.cover_image_url,
+                author={"id": post.author.id, "username": post.author.username},
+                likes_count=len(post.likes),
+                tags=post.tags,
+                createdAt=post.createdAt
+            )
+        )
+    return response_posts
+    # --- END OF FIX ---
 
 @router.post("/posts", response_model=BlogPostRead, status_code=201)
 async def submit_post(post_data: BlogPostCreate, user: User = Depends(current_active_user)):

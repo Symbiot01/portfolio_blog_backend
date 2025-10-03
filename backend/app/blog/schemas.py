@@ -8,6 +8,7 @@ from app.auth.schemas import UserRead
 # Import models for type hinting in helper methods
 from app.models.blog_post import BlogPost
 from app.models.comment import Comment
+from app.models.user import User # Import User for type hinting
 
 class AuthorRead(BaseModel):
     id: PydanticObjectId
@@ -33,10 +34,10 @@ class BlogPostRead(BaseModel):
     tags: Optional[List[str]]
     createdAt: datetime
 
-    # --- THIS IS THE FIX ---
     @classmethod
     def from_db_model(cls, post: BlogPost) -> "BlogPostRead":
-        """Helper method to convert a DB model to this Pydantic schema."""
+        if not post.author: # Handle case where author might not be fetched
+             raise ValueError("Author not fetched for this post")
         return cls(
             id=post.id,
             title=post.title,
@@ -50,7 +51,6 @@ class BlogPostRead(BaseModel):
             tags=post.tags,
             createdAt=post.createdAt,
         )
-    # --- END OF FIX ---
 
 class BlogPostList(BaseModel):
     id: PydanticObjectId
@@ -72,15 +72,23 @@ class CommentRead(BaseModel):
     content: str
     createdAt: datetime
 
-    # --- THIS IS THE FIX (Applied here too) ---
     @classmethod
     def from_db_model(cls, comment: Comment) -> "CommentRead":
         """Helper method to convert a DB model to this Pydantic schema."""
-        author_data = UserRead(**comment.author.dict(), role=comment.author.role.value)
+        if not comment.author:
+            raise ValueError("Author not fetched for this comment")
+        
+        # --- THIS IS THE FIX ---
+        # Explicitly build a dictionary and then validate it with the Pydantic model.
+        # This is the safest way and avoids all collisions.
+        author_dict = comment.author.dict()
+        author_dict['role'] = comment.author.role.value
+        author_data = UserRead.model_validate(author_dict)
+        # --- END OF FIX ---
+        
         return cls(
             id=comment.id,
             author=author_data,
             content=comment.content,
             createdAt=comment.createdAt,
         )
-    # --- END OF FIX ---
