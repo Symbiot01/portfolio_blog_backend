@@ -9,3 +9,6 @@ __pycache__/
 
 # Environment files
 .env
+
+# Logs (Ignore this if youare a developer just my thing)
+codecache.txt

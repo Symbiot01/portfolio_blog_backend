@@ -87,3 +87,20 @@ async def get_comments(post_id: PydanticObjectId, skip: int = 0, limit: int = 20
     ).sort(-Comment.createdAt).skip(skip).limit(limit).to_list()
     
     return [CommentRead.from_db_model(comment) for comment in comments]
+
+
+
+@router.get("/posts/me", response_model=List[BlogPostList])
+async def get_my_posts(user: User = Depends(current_active_user)):
+    """Get all posts authored by the current logged-in user."""
+    posts = await BlogPost.find(
+        BlogPost.author.id == user.id, fetch_links=True
+    ).sort(-BlogPost.createdAt).to_list()
+    
+    return [
+        BlogPostList(
+            **post.dict(),
+            author={"id": post.author.id, "username": post.author.username},
+            likes_count=len(post.likes)
+        ) for post in posts
+    ]
