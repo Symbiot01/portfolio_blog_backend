@@ -1,3 +1,8 @@
+## Note :
+
+You can look in backend folder for main app and readme related to main fastapi backend
+
+---
 ## 🚀 Quick Start
 
 This project uses a hybrid setup: the database runs in Docker, and the Python application runs locally in a virtual environment.
@@ -71,7 +76,3 @@ Manage the MongoDB container from the project's **root directory**.
     ```bash
     docker compose down -v
     ```
-
-
-```
-```
