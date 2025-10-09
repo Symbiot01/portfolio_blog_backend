@@ -4,6 +4,10 @@ from beanie import init_beanie
 from app.models.user import User
 from app.models.blog_post import BlogPost
 from app.models.comment import Comment
+from app.models.trip import Trip
+from app.models.itinerary import ItineraryItem
+from app.models.expense import Expense
+from app.models.settlement import Settlement
 
 async def initialize_database():
     """Initializes the Beanie ODM and connects to the database."""
@@ -16,5 +20,9 @@ async def initialize_database():
             User,
             BlogPost,
             Comment,
+            Trip,
+            ItineraryItem,
+            Expense,
+            Settlement,
         ]
     )

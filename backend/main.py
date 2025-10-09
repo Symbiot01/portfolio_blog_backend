@@ -13,6 +13,7 @@ from app.blog.router import router as blog_router
 from app.auth.router import router as auth_router
 from app.uploads.router import router as uploads_router
 from app.admin.router import router as admin_router
+from app.tripsync.router import router as tripsync_router
 from app.core.database import initialize_database
 
 limiter = Limiter(key_func=get_remote_address)
@@ -43,6 +44,7 @@ app.include_router(auth_router, prefix="/api/auth")
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
 app.include_router(blog_router, prefix="/api/blog", tags=["Blog"])
 app.include_router(uploads_router, prefix="/api/uploads", tags=["Uploads"])
+app.include_router(tripsync_router, prefix="/api/tripsync", tags=["TripSync"])  
 
 @app.get("/api/health")
 @limiter.limit("5/minute")
