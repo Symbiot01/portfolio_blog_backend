@@ -1,6 +1,6 @@
 # app/models/user.py
 from beanie import Document
-from pydantic import EmailStr
+from pydantic import EmailStr, Field
 from enum import Enum
 from fastapi_users.db import BeanieBaseUser
 from typing import Optional
@@ -14,7 +14,7 @@ class Role(str, Enum):
 class User(BeanieBaseUser, Document):
     email: EmailStr
     username: str
-    
+    is_guest: bool = Field(default=False)
     googleId: Optional[str] = None
     avatar: Optional[str] = None
     bio: Optional[str] = None
