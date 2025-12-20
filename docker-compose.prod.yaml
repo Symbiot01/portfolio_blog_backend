@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  mongo:
+    image: mongo:latest
+    container_name: mongodb-prod
+    ports:
+      # Production MongoDB port
+      - "27018:27017"
+    volumes:
+      - mongo-data-prod:/data/db
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-changeme}
+    networks:
+      - backend-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: portfolio-backend-prod
+    ports:
+      # Production backend port
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-mongodb://mongo:27017}
+      - DATABASE_NAME=${DATABASE_NAME:-portfolio}
+      - SECRET_KEY=${SECRET_KEY:-changeme}
+      - ENVIRONMENT=production
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - mongo
+    restart: unless-stopped
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  mongo-data-prod:
+
+networks:
+  backend-network:
+    driver: bridge
+

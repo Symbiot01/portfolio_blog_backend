@@ -1,0 +1,92 @@
+name: Test Production Docker Compose
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+  workflow_dispatch:
+
+jobs:
+  test-production:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Install netcat for port checks
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create .env file for testing
+        run: |
+          cat > .env << EOF
+          DATABASE_URL=mongodb://mongo:27017
+          DATABASE_NAME=portfolio_test
+          SECRET_KEY=test_secret_key_for_ci
+          MONGO_ROOT_USERNAME=test_admin
+          MONGO_ROOT_PASSWORD=test_password
+          EOF
+
+      - name: Build and start services
+        run: |
+          docker-compose -f docker-compose.prod.yaml build
+          docker-compose -f docker-compose.prod.yaml up -d
+
+      - name: Show running containers
+        run: |
+          docker-compose -f docker-compose.prod.yaml ps
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for MongoDB to be ready..."
+          timeout 60 bash -c 'until docker exec mongodb-prod mongosh --eval "db.adminCommand(\"ping\")" --quiet 2>/dev/null || docker exec mongodb-prod mongo --eval "db.adminCommand(\"ping\")" --quiet 2>/dev/null || nc -z localhost 27018; do sleep 2; done' || exit 1
+          
+          echo "Waiting for backend to be ready..."
+          timeout 60 bash -c 'until curl -f http://localhost:8001/api/health; do sleep 2; done' || exit 1
+
+      - name: Test MongoDB connection
+        run: |
+          if docker exec mongodb-prod mongosh --eval "db.adminCommand('ping')" --quiet 2>/dev/null; then
+            echo "MongoDB is responding (mongosh)!"
+          elif docker exec mongodb-prod mongo --eval "db.adminCommand('ping')" --quiet 2>/dev/null; then
+            echo "MongoDB is responding (mongo)!"
+          elif nc -z localhost 27018; then
+            echo "MongoDB port is open!"
+          else
+            echo "MongoDB connection test failed"
+            exit 1
+          fi
+
+      - name: Test backend health endpoint
+        run: |
+          response=$(curl -f http://localhost:8001/api/health)
+          echo "Health check response: $response"
+          if echo "$response" | grep -q "status"; then
+            echo "✓ Backend health check passed"
+          else
+            echo "✗ Backend health check failed"
+            exit 1
+          fi
+
+      - name: Test backend API endpoints
+        run: |
+          # Test that the API is responding
+          curl -f http://localhost:8001/api/health || exit 1
+          echo "✓ API endpoints are accessible"
+
+      - name: Check container logs
+        if: failure()
+        run: |
+          echo "=== Backend logs ==="
+          docker logs portfolio-backend-prod
+          echo "=== MongoDB logs ==="
+          docker logs mongodb-prod
+
+      - name: Stop services
+        if: always()
+        run: |
+          docker-compose -f docker-compose.prod.yaml down -v
+
