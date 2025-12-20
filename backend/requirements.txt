@@ -1,19 +1,27 @@
-# FastAPI and Server
-fastapi[all]
-uvicorn
+# NOTE: Pinned, compatible deps for Python 3.12 (Dockerfile uses python:3.12-slim).
+# Keep this file deterministic for production deploys.
 
-# Database
-beanie
-motor
-python-dotenv
+# FastAPI and server
+fastapi==0.125.0
+uvicorn[standard]==0.38.0
+slowapi==0.1.9
+python-dotenv==1.2.1
 
-# Authentication
-fastapi-users[beanie]
-python-jose[cryptography]
-passlib[bcrypt]
+# Database (MongoDB + Beanie ODM)
+beanie==2.0.1
+motor==3.7.1
+# Explicitly pin pymongo to satisfy motor/beanie constraints (and avoid accidental 3.x installs).
+pymongo==4.11.0
 
-#Blog
-python-multipart
-cloudinary
-slugify
-python-slugify
+# Authentication (FastAPI-Users)
+fastapi-users[beanie]==15.0.3
+
+# Pydantic email validation (used by `EmailStr`)
+email-validator==2.3.0
+
+# Uploads
+python-multipart==0.0.21
+cloudinary==1.44.1
+
+# Blog slugs (provides `from slugify import slugify`)
+python-slugify==8.0.4
