@@ -9,6 +9,9 @@ from app.models.user import User
 from app.auth.db import get_user_db
 
 SECRET = os.getenv("SECRET_KEY")
+if not SECRET:
+    # Fail fast so password reset / verification flows don't misbehave at runtime.
+    raise RuntimeError("SECRET_KEY environment variable is required for auth token secrets")
 
 class UserManager(BaseUserManager[User, PydanticObjectId]):
     reset_password_token_secret = SECRET
