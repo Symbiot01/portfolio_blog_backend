@@ -1,7 +1,7 @@
 # FILE: ./app/tripsync/schemas.py (NEW FILE)
 from pydantic import BaseModel, Field
 from beanie import PydanticObjectId
-from typing import List, Optional
+from typing import List, Optional, Literal
 from datetime import datetime
 
 # --- Trip Schemas ---
@@ -70,18 +70,21 @@ class ExpenseUpdate(BaseModel):
 class SettlementCreate(BaseModel):
     payer_member_id: str
     payee_member_id: str
-    amount: float
+    amount: float = Field(..., gt=0)
+    mode: Literal["cash", "upi", "card"] = "upi"
 
 class SettlementRead(BaseModel):
     id: PydanticObjectId
     payer_member_id: str
     payee_member_id: str
     amount: float
+    mode: Literal["cash", "upi", "card"]
 
 class SettlementUpdate(BaseModel):
     payer_member_id: Optional[str] = None
     payee_member_id: Optional[str] = None
-    amount: Optional[float] = None
+    amount: Optional[float] = Field(default=None, gt=0)
+    mode: Optional[Literal["cash", "upi", "card"]] = None
 
 class BalanceEntry(BaseModel):
     member_id: str
@@ -89,3 +92,9 @@ class BalanceEntry(BaseModel):
 
 class LinkExpiryUpdate(BaseModel):
     link_expires_at: Optional[datetime] = None
+
+class TripLinkInfo(BaseModel):
+    secret_access_url: str
+    link_revoked: bool
+    link_expires_at: Optional[datetime] = None
+    access_token_version: int

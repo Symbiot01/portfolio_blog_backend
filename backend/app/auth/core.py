@@ -13,3 +13,7 @@ fastapi_users = FastAPIUsers[User, PydanticObjectId](
 
 # This is a dependency that can be used in your own API endpoints to get the current user
 current_active_user = fastapi_users.current_user(active=True)
+
+# Optional auth dependency for endpoints that support "guest via access link" flows.
+# When unauthenticated, this dependency returns None instead of raising 401.
+current_optional_user = fastapi_users.current_user(active=True, optional=True)

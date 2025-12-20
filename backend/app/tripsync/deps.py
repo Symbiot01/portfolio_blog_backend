@@ -3,7 +3,7 @@ from fastapi import Depends, HTTPException, Request
 from beanie import PydanticObjectId
 from datetime import datetime
 
-from app.auth.core import current_active_user
+from app.auth.core import current_optional_user
 from app.models.user import User
 from app.models.trip import Trip, TripMember
 
@@ -18,7 +18,7 @@ class ActorContext(TypedDict, total=False):
 def resolve_trip_actor(param_trip_id: str):
     async def _resolver(
         request: Request,
-        user: Optional[User] = Depends(current_active_user),
+        user: Optional[User] = Depends(current_optional_user),
         trip_id: PydanticObjectId = None,
     ) -> ActorContext:
         # Path param must be provided by the route signature
@@ -28,12 +28,6 @@ def resolve_trip_actor(param_trip_id: str):
         trip = await Trip.get(trip_id)
         if not trip:
             raise HTTPException(status_code=404, detail="Trip not found")
-
-        # Check link lifecycle
-        if trip.link_revoked:
-            raise HTTPException(status_code=403, detail="Access link revoked")
-        if trip.link_expires_at and datetime.utcnow() > trip.link_expires_at:
-            raise HTTPException(status_code=403, detail="Access link expired")
 
         # If user is authenticated and linked as member → allow via login
         if user is not None:
@@ -49,6 +43,12 @@ def resolve_trip_actor(param_trip_id: str):
             # Not a linked member → fall through to quicklink if provided
 
         # Quicklink path: header or query
+        # Check link lifecycle (quicklink only). Logged-in linked members should still have access.
+        if trip.link_revoked:
+            raise HTTPException(status_code=403, detail="Access link revoked")
+        if trip.link_expires_at and datetime.utcnow() > trip.link_expires_at:
+            raise HTTPException(status_code=403, detail="Access link expired")
+
         access_token = request.headers.get("X-Trip-Access") or request.query_params.get("access_token")
         if not access_token:
             raise HTTPException(status_code=403, detail="Not authorized for this trip")
