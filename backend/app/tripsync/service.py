@@ -1,4 +1,7 @@
 from typing import Optional
+import math
+
+from fastapi import HTTPException
 from beanie import PydanticObjectId
 
 from app.models.trip import Trip, TripMember
@@ -7,9 +10,23 @@ from app.models.itinerary import ItineraryItem
 from app.models.expense import Expense
 from app.models.settlement import Settlement
 from app.tripsync.schemas import ExpenseCreate, ItineraryItemCreate, SettlementCreate, BalanceEntry
+from app.tripsync.balance_math import apply_settlement
 
 
 class TripService:
+    @staticmethod
+    def _validate_settlement(trip: Trip, payer_member_id: str, payee_member_id: str, amount: float) -> None:
+        if payer_member_id == payee_member_id:
+            raise HTTPException(status_code=400, detail="payer_member_id and payee_member_id must be different")
+        if not math.isfinite(amount) or amount <= 0:
+            raise HTTPException(status_code=400, detail="amount must be a finite positive number")
+
+        member_ids = {str(m.member_id) for m in trip.members}
+        if payer_member_id not in member_ids:
+            raise HTTPException(status_code=400, detail="payer_member_id is not a member of this trip")
+        if payee_member_id not in member_ids:
+            raise HTTPException(status_code=400, detail="payee_member_id is not a member of this trip")
+
     @staticmethod
     async def add_member(trip: Trip, display_name: str, user: Optional[User] = None) -> Trip:
         # Prevent duplicate linked member for same user within a trip
@@ -65,11 +82,13 @@ class TripService:
 
     @staticmethod
     async def add_settlement(trip: Trip, data: SettlementCreate) -> Settlement:
+        TripService._validate_settlement(trip, data.payer_member_id, data.payee_member_id, data.amount)
         settlement = Settlement(
             trip=trip,
             payer_member_id=data.payer_member_id,
             payee_member_id=data.payee_member_id,
             amount=data.amount,
+            mode=data.mode or "upi",
         )
         return await settlement.insert()
 
@@ -90,11 +109,14 @@ class TripService:
             for mid in e.split_with_member_ids:
                 balance_map[mid] = balance_map.get(mid, 0.0) - share
 
-        # Settlements: money moved from payer -> payee
+        # Settlements: payer pays payee (see balance_math.apply_settlement for sign convention).
         settlements = await Settlement.find(Settlement.trip.id == trip.id).to_list()
         for s in settlements:
-            balance_map[s.payer_member_id] = balance_map.get(s.payer_member_id, 0.0) - s.amount
-            balance_map[s.payee_member_id] = balance_map.get(s.payee_member_id, 0.0) + s.amount
+            # Be defensive in case legacy data contains bad values; don't break balances endpoint.
+            try:
+                apply_settlement(balance_map, s.payer_member_id, s.payee_member_id, s.amount)
+            except ValueError:
+                continue
 
         return [BalanceEntry(member_id=mid, balance=round(bal, 2)) for mid, bal in balance_map.items()]
 

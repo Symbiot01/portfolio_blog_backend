@@ -11,13 +11,17 @@ from .schemas import (
     TripMemberCreate,
     LinkSelfRequest,
     ItineraryItemCreate,
+    ItineraryItemRead,
     ItineraryItemUpdate,
     ExpenseCreate,
+    ExpenseRead,
     ExpenseUpdate,
     SettlementCreate,
+    SettlementRead,
     SettlementUpdate,
     BalanceEntry,
     LinkExpiryUpdate,
+    TripLinkInfo,
 )
 from app.models.trip import Trip, TripMember
 from .deps import resolve_trip_actor
@@ -28,6 +32,29 @@ from slowapi.util import get_remote_address
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
+
+# region agent log
+def _agent_log(hypothesisId: str, location: str, message: str, data: dict):
+    try:
+        import json, time, os
+        with open("/home/dev/Projects/portfolio/portfolio-backend/.cursor/debug.log", "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "sessionId": "debug-session",
+                        "runId": os.getenv("AGENT_RUN_ID", "accesslink-pre"),
+                        "hypothesisId": hypothesisId,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+# endregion agent log
 
 @router.post("/", response_model=TripRead, status_code=201)
 async def create_trip(
@@ -66,7 +93,19 @@ async def create_trip(
 
 @router.get("/my", response_model=List[TripRead])
 async def get_my_trips(user: User = Depends(current_active_user)):
-    trips = await Trip.find(Trip.members.user.id == user.id).to_list()
+    # Fetch all trips with links resolved
+    all_trips = await Trip.find_all(fetch_links=True).to_list()
+    
+    # Filter trips where the user is a linked member
+    user_trips = [
+        trip for trip in all_trips
+        if any(
+            member.user is not None and 
+            (member.user.id == user.id if hasattr(member.user, 'id') else False)
+            for member in trip.members
+        )
+    ]
+    
     return [
         TripRead(
             id=t.id,
@@ -81,13 +120,57 @@ async def get_my_trips(user: User = Depends(current_active_user)):
                 for m in t.members
             ],
         )
-        for t in trips
+        for t in user_trips
     ]
 
 @router.get("/access/{access_token}", response_model=TripRead)
 @limiter.limit("30/minute")
 async def preview_trip_by_access(access_token: str, request: Request):
+    # Hypotheses:
+    # A) access_token stored as UUID, but we compare to str -> no match (404)
+    # B) token parsing/format differs (missing dashes, whitespace, etc.)
+    _agent_log(
+        "A",
+        "backend/app/tripsync/router.py:preview_trip_by_access",
+        "enter",
+        {"token_len": len(access_token or ""), "token_prefix": (access_token or "")[:8]},
+    )
+
+    parsed_uuid = None
+    try:
+        import uuid
+        parsed_uuid = uuid.UUID(access_token)
+        _agent_log(
+            "A",
+            "backend/app/tripsync/router.py:preview_trip_by_access",
+            "uuid_parse_ok",
+            {"token_prefix": (access_token or "")[:8]},
+        )
+    except Exception as e:
+        _agent_log(
+            "B",
+            "backend/app/tripsync/router.py:preview_trip_by_access",
+            "uuid_parse_failed",
+            {"exc_type": e.__class__.__name__, "exc_msg": str(e)[:120]},
+        )
+
     trip = await Trip.find_one(Trip.access_token == access_token)
+    _agent_log(
+        "A",
+        "backend/app/tripsync/router.py:preview_trip_by_access",
+        "query_by_str_done",
+        {"found": bool(trip)},
+    )
+
+    if (trip is None) and (parsed_uuid is not None):
+        trip = await Trip.find_one(Trip.access_token == parsed_uuid)
+        _agent_log(
+            "A",
+            "backend/app/tripsync/router.py:preview_trip_by_access",
+            "query_by_uuid_done",
+            {"found": bool(trip)},
+        )
+
     if not trip:
         raise HTTPException(status_code=404, detail="Invalid access link")
     return TripRead(
@@ -166,6 +249,27 @@ async def add_itinerary(
     await record_audit(request, actor, "itinerary.create", {"item_id": str(item.id)})
     return {"id": str(item.id)}
 
+@router.get("/{trip_id}/itinerary/{item_id}")
+async def get_itinerary_item(
+    trip_id: PydanticObjectId,
+    item_id: PydanticObjectId,
+    actor = Depends(resolve_trip_actor("trip_id")),
+):
+    """Get a single itinerary item by ID for editing"""
+    from app.models.itinerary import ItineraryItem
+    item = await ItineraryItem.get(item_id)
+    if not item or str(item.trip.ref.id) != str(actor["trip"].id):
+        raise HTTPException(status_code=404, detail="Itinerary item not found")
+    return {
+        "id": str(item.id),
+        "title": item.title,
+        "item_type": item.item_type,
+        "start_time": item.start_time,
+        "end_time": item.end_time,
+        "location": item.location,
+        "notes": getattr(item, "notes", None),
+    }
+
 @router.patch("/{trip_id}/itinerary/{item_id}")
 @limiter.limit("60/minute")
 async def update_itinerary(
@@ -177,7 +281,7 @@ async def update_itinerary(
 ):
     from app.models.itinerary import ItineraryItem
     item = await ItineraryItem.get(item_id)
-    if not item or str(item.trip.id) != str(actor["trip"].id):
+    if not item or str(item.trip.ref.id) != str(actor["trip"].id):
         raise HTTPException(status_code=404, detail="Itinerary item not found")
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
     for k, v in update_data.items():
@@ -196,7 +300,7 @@ async def delete_itinerary(
 ):
     from app.models.itinerary import ItineraryItem
     item = await ItineraryItem.get(item_id)
-    if not item or str(item.trip.id) != str(actor["trip"].id):
+    if not item or str(item.trip.ref.id) != str(actor["trip"].id):
         raise HTTPException(status_code=404, detail="Itinerary item not found")
     await item.delete()
     await record_audit(request, actor, "itinerary.delete", {"item_id": str(item_id)})
@@ -218,6 +322,25 @@ async def add_expense(
     await record_audit(request, actor, "expense.create", {"expense_id": str(expense.id)})
     return {"id": str(expense.id)}
 
+@router.get("/{trip_id}/expenses/{expense_id}")
+async def get_expense(
+    trip_id: PydanticObjectId,
+    expense_id: PydanticObjectId,
+    actor = Depends(resolve_trip_actor("trip_id")),
+):
+    """Get a single expense by ID for editing"""
+    from app.models.expense import Expense
+    exp = await Expense.get(expense_id)
+    if not exp or str(exp.trip.ref.id) != str(actor["trip"].id):
+        raise HTTPException(status_code=404, detail="Expense not found")
+    return {
+        "id": str(exp.id),
+        "description": exp.description,
+        "amount": exp.amount,
+        "paid_by_member_id": exp.paid_by_member_id,
+        "split_with_member_ids": exp.split_with_member_ids,
+    }
+
 @router.patch("/{trip_id}/expenses/{expense_id}")
 @limiter.limit("60/minute")
 async def update_expense(
@@ -229,7 +352,7 @@ async def update_expense(
 ):
     from app.models.expense import Expense
     exp = await Expense.get(expense_id)
-    if not exp or str(exp.trip.id) != str(actor["trip"].id):
+    if not exp or str(exp.trip.ref.id) != str(actor["trip"].id):
         raise HTTPException(status_code=404, detail="Expense not found")
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
     for k, v in update_data.items():
@@ -248,7 +371,7 @@ async def delete_expense(
 ):
     from app.models.expense import Expense
     exp = await Expense.get(expense_id)
-    if not exp or str(exp.trip.id) != str(actor["trip"].id):
+    if not exp or str(exp.trip.ref.id) != str(actor["trip"].id):
         raise HTTPException(status_code=404, detail="Expense not found")
     await exp.delete()
     await record_audit(request, actor, "expense.delete", {"expense_id": str(expense_id)})
@@ -267,6 +390,25 @@ async def add_settlement(
     await record_audit(request, actor, "settlement.create", {"settlement_id": str(settlement.id)})
     return {"id": str(settlement.id)}
 
+@router.get("/{trip_id}/settlements/{settlement_id}")
+async def get_settlement(
+    trip_id: PydanticObjectId,
+    settlement_id: PydanticObjectId,
+    actor = Depends(resolve_trip_actor("trip_id")),
+):
+    """Get a single settlement by ID for editing"""
+    from app.models.settlement import Settlement
+    s = await Settlement.get(settlement_id)
+    if not s or str(s.trip.ref.id) != str(actor["trip"].id):
+        raise HTTPException(status_code=404, detail="Settlement not found")
+    return {
+        "id": str(s.id),
+        "payer_member_id": s.payer_member_id,
+        "payee_member_id": s.payee_member_id,
+        "amount": s.amount,
+        "mode": s.mode,
+    }
+
 @router.patch("/{trip_id}/settlements/{settlement_id}")
 @limiter.limit("60/minute")
 async def update_settlement(
@@ -278,9 +420,17 @@ async def update_settlement(
 ):
     from app.models.settlement import Settlement
     s = await Settlement.get(settlement_id)
-    if not s or str(s.trip.id) != str(actor["trip"].id):
+    if not s or str(s.trip.ref.id) != str(actor["trip"].id):
         raise HTTPException(status_code=404, detail="Settlement not found")
+
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+
+    # Validate merged settlement state against trip membership and invariants.
+    merged_payer = update_data.get("payer_member_id", s.payer_member_id)
+    merged_payee = update_data.get("payee_member_id", s.payee_member_id)
+    merged_amount = update_data.get("amount", s.amount)
+    TripService._validate_settlement(actor["trip"], merged_payer, merged_payee, merged_amount)
+
     for k, v in update_data.items():
         setattr(s, k, v)
     await s.save()
@@ -297,7 +447,7 @@ async def delete_settlement(
 ):
     from app.models.settlement import Settlement
     s = await Settlement.get(settlement_id)
-    if not s or str(s.trip.id) != str(actor["trip"].id):
+    if not s or str(s.trip.ref.id) != str(actor["trip"].id):
         raise HTTPException(status_code=404, detail="Settlement not found")
     await s.delete()
     await record_audit(request, actor, "settlement.delete", {"settlement_id": str(settlement_id)})
@@ -315,77 +465,34 @@ async def get_balances(
     return balances
 
 
-# --- GET listings ---
-
-@router.get("/{trip_id}", response_model=TripRead)
-async def get_trip_details(
-    trip_id: PydanticObjectId,
-    actor = Depends(resolve_trip_actor("trip_id")),
-):
-    trip = actor["trip"]
-    return TripRead(
-        id=trip.id,
-        name=trip.name,
-        description=trip.description,
-        members=[
-            TripMemberInfo(member_id=str(m.member_id), display_name=m.display_name, linked=bool(m.user))
-            for m in trip.members
-        ],
-    )
-
-@router.get("/{trip_id}/itinerary", response_model=List[ItineraryItemCreate])
-async def list_itinerary(
-    trip_id: PydanticObjectId,
-    actor = Depends(resolve_trip_actor("trip_id")),
-):
-    from app.models.itinerary import ItineraryItem
-    items = await ItineraryItem.find(ItineraryItem.trip.id == actor["trip"].id).to_list()
-    return [
-        ItineraryItemCreate(
-            title=i.title,
-            item_type=i.item_type,
-            start_time=i.start_time,
-            end_time=i.end_time,
-            location=i.location,
-        )
-        for i in items
-    ]
-
-@router.get("/{trip_id}/expenses", response_model=List[ExpenseUpdate])
-async def list_expenses(
-    trip_id: PydanticObjectId,
-    actor = Depends(resolve_trip_actor("trip_id")),
-):
-    from app.models.expense import Expense as ExpModel
-    exps = await ExpModel.find(ExpModel.trip.id == actor["trip"].id).to_list()
-    return [
-        ExpenseUpdate(
-            description=e.description,
-            amount=e.amount,
-            paid_by_member_id=e.paid_by_member_id,
-            split_with_member_ids=e.split_with_member_ids,
-        )
-        for e in exps
-    ]
-
-@router.get("/{trip_id}/settlements", response_model=List[SettlementUpdate])
-async def list_settlements(
-    trip_id: PydanticObjectId,
-    actor = Depends(resolve_trip_actor("trip_id")),
-):
-    from app.models.settlement import Settlement as SetModel
-    sts = await SetModel.find(SetModel.trip.id == actor["trip"].id).to_list()
-    return [
-        SettlementUpdate(
-            payer_member_id=s.payer_member_id,
-            payee_member_id=s.payee_member_id,
-            amount=s.amount,
-        )
-        for s in sts
-    ]
-
-
 # --- Link lifecycle (auth + membership) ---
+# These routes must come before the generic GET /{trip_id} route
+
+@router.get("/{trip_id}/link", response_model=TripLinkInfo)
+async def get_trip_link(
+    trip_id: PydanticObjectId,
+    user: User = Depends(current_active_user),
+    request: Request = None,
+):
+    """Get the current access link for a trip"""
+    trip = await Trip.get(trip_id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    
+    # Only linked members can view the link
+    is_member = any(m.user is not None and getattr(m.user, "id", None) == user.id for m in trip.members)
+    if not is_member:
+        raise HTTPException(status_code=403, detail="Not a trip member")
+    
+    base_url = str(request.base_url)
+    access_url = f"{base_url}api/tripsync/access/{trip.access_token}"
+    
+    return TripLinkInfo(
+        secret_access_url=access_url,
+        link_revoked=trip.link_revoked,
+        link_expires_at=trip.link_expires_at,
+        access_token_version=trip.access_token_version,
+    )
 
 @router.post("/{trip_id}/rotate-link")
 async def rotate_link(
@@ -442,3 +549,77 @@ async def update_link_expiry(
     await trip.save()
     await record_audit(request, {"trip": trip, "actor_user": user, "source": "login"}, "link.expiry", {"link_expires_at": payload.link_expires_at.isoformat() if payload.link_expires_at else None})
     return {"link_expires_at": trip.link_expires_at}
+
+
+# --- GET listings ---
+
+@router.get("/{trip_id}", response_model=TripRead)
+async def get_trip_details(
+    trip_id: PydanticObjectId,
+    actor = Depends(resolve_trip_actor("trip_id")),
+):
+    trip = actor["trip"]
+    return TripRead(
+        id=trip.id,
+        name=trip.name,
+        description=trip.description,
+        members=[
+            TripMemberInfo(member_id=str(m.member_id), display_name=m.display_name, linked=bool(m.user))
+            for m in trip.members
+        ],
+    )
+
+@router.get("/{trip_id}/itinerary", response_model=List[ItineraryItemRead])
+async def list_itinerary(
+    trip_id: PydanticObjectId,
+    actor = Depends(resolve_trip_actor("trip_id")),
+):
+    from app.models.itinerary import ItineraryItem
+    items = await ItineraryItem.find(ItineraryItem.trip.id == actor["trip"].id).to_list()
+    return [
+        ItineraryItemRead(
+            id=i.id,
+            title=i.title,
+            item_type=i.item_type,
+            start_time=i.start_time,
+            end_time=i.end_time,
+            location=i.location,
+        )
+        for i in items
+    ]
+
+@router.get("/{trip_id}/expenses", response_model=List[ExpenseRead])
+async def list_expenses(
+    trip_id: PydanticObjectId,
+    actor = Depends(resolve_trip_actor("trip_id")),
+):
+    from app.models.expense import Expense as ExpModel
+    exps = await ExpModel.find(ExpModel.trip.id == actor["trip"].id).to_list()
+    return [
+        ExpenseRead(
+            id=e.id,
+            description=e.description,
+            amount=e.amount,
+            paid_by_member_id=e.paid_by_member_id,
+            split_with_member_ids=e.split_with_member_ids,
+        )
+        for e in exps
+    ]
+
+@router.get("/{trip_id}/settlements", response_model=List[SettlementRead])
+async def list_settlements(
+    trip_id: PydanticObjectId,
+    actor = Depends(resolve_trip_actor("trip_id")),
+):
+    from app.models.settlement import Settlement as SetModel
+    sts = await SetModel.find(SetModel.trip.id == actor["trip"].id).to_list()
+    return [
+        SettlementRead(
+            id=s.id,
+            payer_member_id=s.payer_member_id,
+            payee_member_id=s.payee_member_id,
+            amount=s.amount,
+            mode=s.mode,
+        )
+        for s in sts
+    ]
