@@ -38,6 +38,11 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
+    # Production safety: fail fast if critical env vars are missing.
+    required = ["DATABASE_URL", "DATABASE_NAME", "SECRET_KEY"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
     await initialize_database()
 
 app.include_router(auth_router, prefix="/api/auth")
