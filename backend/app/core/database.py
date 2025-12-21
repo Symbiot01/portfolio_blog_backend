@@ -8,6 +8,9 @@ from app.models.trip import Trip
 from app.models.itinerary import ItineraryItem
 from app.models.expense import Expense
 from app.models.settlement import Settlement
+from app.models.trip_doc import TripDoc
+from app.models.trip_audit import TripAuditEvent
+from app.models.trip_edit_nonce import TripEditNonce
 
 async def initialize_database():
     """Initializes the Beanie ODM and connects to the database."""
@@ -26,5 +29,8 @@ async def initialize_database():
             ItineraryItem,
             Expense,
             Settlement,
+            TripDoc,
+            TripAuditEvent,
+            TripEditNonce,
         ]
     )

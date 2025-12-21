@@ -1,7 +1,10 @@
 # FILE: ./app/tripsync/router.py (NEW FILE)
 from fastapi import APIRouter, Depends, Request, HTTPException
-from typing import List
+from typing import Any, Dict, List
 from beanie import PydanticObjectId
+from datetime import datetime
+import secrets
+from pydantic import ValidationError
 from app.models.user import User
 from app.auth.core import current_active_user
 from .schemas import (
@@ -22,39 +25,36 @@ from .schemas import (
     BalanceEntry,
     LinkExpiryUpdate,
     TripLinkInfo,
+    TripDocGetResponse,
+    TripDocPatchRequest,
+    TripDocPatchResponse,
+    AiProposeEditsRequest,
+    AiProposeEditsResponse,
+    AiApplyEditsRequest,
+    AiApplyEditsResponse,
+    JsonPatchOp,
+    ItineraryOp,
 )
 from app.models.trip import Trip, TripMember
+from app.models.trip_doc import TripDoc
+from app.models.trip_edit_nonce import TripEditNonce
 from .deps import resolve_trip_actor
 from .audit import record_audit
 from .service import TripService
+from .timezone import coerce_to_utc, ensure_end_not_before_start
+from .json_patch import apply_json_patch, JsonPatchError
+from .tripdoc_validators import normalize_tripdoc_dates, validate_patch_paths, validate_tripdoc_invariants
+from .ai_client import get_openrouter_client, get_openrouter_model, get_openrouter_fallback_model, OpenRouterError
+from .ai_prompts import TRIP_EDITOR_SYSTEM_PROMPT
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
 
-# region agent log
-def _agent_log(hypothesisId: str, location: str, message: str, data: dict):
-    try:
-        import json, time, os
-        with open("/home/dev/Projects/portfolio/portfolio-backend/.cursor/debug.log", "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": os.getenv("AGENT_RUN_ID", "accesslink-pre"),
-                        "hypothesisId": hypothesisId,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-# endregion agent log
+def _require_quicklink_edit(actor: Dict[str, Any]) -> None:
+    if actor.get("source") == "quicklink" and not actor.get("can_edit"):
+        raise HTTPException(status_code=403, detail="Quicklink edit not enabled (send X-Trip-Edit: 1)")
 
 @router.post("/", response_model=TripRead, status_code=201)
 async def create_trip(
@@ -126,50 +126,17 @@ async def get_my_trips(user: User = Depends(current_active_user)):
 @router.get("/access/{access_token}", response_model=TripRead)
 @limiter.limit("30/minute")
 async def preview_trip_by_access(access_token: str, request: Request):
-    # Hypotheses:
-    # A) access_token stored as UUID, but we compare to str -> no match (404)
-    # B) token parsing/format differs (missing dashes, whitespace, etc.)
-    _agent_log(
-        "A",
-        "backend/app/tripsync/router.py:preview_trip_by_access",
-        "enter",
-        {"token_len": len(access_token or ""), "token_prefix": (access_token or "")[:8]},
-    )
-
     parsed_uuid = None
     try:
         import uuid
         parsed_uuid = uuid.UUID(access_token)
-        _agent_log(
-            "A",
-            "backend/app/tripsync/router.py:preview_trip_by_access",
-            "uuid_parse_ok",
-            {"token_prefix": (access_token or "")[:8]},
-        )
-    except Exception as e:
-        _agent_log(
-            "B",
-            "backend/app/tripsync/router.py:preview_trip_by_access",
-            "uuid_parse_failed",
-            {"exc_type": e.__class__.__name__, "exc_msg": str(e)[:120]},
-        )
+    except Exception:
+        parsed_uuid = None
 
     trip = await Trip.find_one(Trip.access_token == access_token)
-    _agent_log(
-        "A",
-        "backend/app/tripsync/router.py:preview_trip_by_access",
-        "query_by_str_done",
-        {"found": bool(trip)},
-    )
 
     if (trip is None) and (parsed_uuid is not None):
         trip = await Trip.find_one(Trip.access_token == parsed_uuid)
-        _agent_log(
-            "A",
-            "backend/app/tripsync/router.py:preview_trip_by_access",
-            "query_by_uuid_done",
-            {"found": bool(trip)},
-        )
 
     if not trip:
         raise HTTPException(status_code=404, detail="Invalid access link")
@@ -199,6 +166,7 @@ async def add_member(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
     trip = actor["trip"]
     trip = await TripService.add_member(trip, display_name=payload.display_name)
     await record_audit(request, actor, "member.create", {"display_name": payload.display_name})
@@ -245,15 +213,34 @@ async def add_itinerary(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
+    # Place metadata must be complete if provided
+    if (payload.lat is None) != (payload.lng is None):
+        raise HTTPException(status_code=400, detail="lat and lng must be provided together")
+
+    # Timezone contract: normalize to UTC at API boundary
+    start_utc = coerce_to_utc(payload.start_time, assume_tz="UTC")
+    end_utc = coerce_to_utc(payload.end_time, assume_tz="UTC") if payload.end_time else None
+    try:
+        ensure_end_not_before_start(start_utc, end_utc)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if payload.all_day:
+        start_utc = start_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    payload = payload.model_copy(update={"start_time": start_utc, "end_time": end_utc})
     item = await TripService.add_itinerary_item(actor["trip"], payload)
     await record_audit(request, actor, "itinerary.create", {"item_id": str(item.id)})
     return {"id": str(item.id)}
 
 @router.get("/{trip_id}/itinerary/{item_id}")
+@limiter.limit("60/minute")
 async def get_itinerary_item(
     trip_id: PydanticObjectId,
     item_id: PydanticObjectId,
     actor = Depends(resolve_trip_actor("trip_id")),
+    request: Request = None,
 ):
     """Get a single itinerary item by ID for editing"""
     from app.models.itinerary import ItineraryItem
@@ -268,6 +255,11 @@ async def get_itinerary_item(
         "end_time": item.end_time,
         "location": item.location,
         "notes": getattr(item, "notes", None),
+        "day_index": getattr(item, "day_index", None),
+        "all_day": getattr(item, "all_day", False),
+        "place_id": getattr(item, "place_id", None),
+        "lat": getattr(item, "lat", None),
+        "lng": getattr(item, "lng", None),
     }
 
 @router.patch("/{trip_id}/itinerary/{item_id}")
@@ -279,11 +271,45 @@ async def update_itinerary(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
     from app.models.itinerary import ItineraryItem
     item = await ItineraryItem.get(item_id)
     if not item or str(item.trip.ref.id) != str(actor["trip"].id):
         raise HTTPException(status_code=404, detail="Itinerary item not found")
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+
+    # Validate merged place metadata
+    merged_lat = update_data.get("lat", getattr(item, "lat", None))
+    merged_lng = update_data.get("lng", getattr(item, "lng", None))
+    if (merged_lat is None) != (merged_lng is None):
+        raise HTTPException(status_code=400, detail="lat and lng must be provided together")
+
+    # Normalize any updated times to UTC, and validate merged interval
+    merged_start = update_data.get("start_time", item.start_time)
+    merged_end = update_data.get("end_time", item.end_time)
+
+    if "start_time" in update_data and update_data["start_time"] is not None:
+        merged_start = coerce_to_utc(update_data["start_time"], assume_tz="UTC")
+        update_data["start_time"] = merged_start
+    else:
+        merged_start = coerce_to_utc(merged_start, assume_tz="UTC") if merged_start else merged_start
+
+    if "end_time" in update_data:
+        merged_end = coerce_to_utc(update_data["end_time"], assume_tz="UTC") if update_data["end_time"] else None
+        update_data["end_time"] = merged_end
+    else:
+        merged_end = coerce_to_utc(merged_end, assume_tz="UTC") if merged_end else None
+
+    merged_all_day = update_data.get("all_day", getattr(item, "all_day", False))
+    if merged_all_day and merged_start:
+        merged_start = merged_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        update_data["start_time"] = merged_start
+
+    try:
+        ensure_end_not_before_start(merged_start, merged_end)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     for k, v in update_data.items():
         setattr(item, k, v)
     await item.save()
@@ -298,6 +324,7 @@ async def delete_itinerary(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
     from app.models.itinerary import ItineraryItem
     item = await ItineraryItem.get(item_id)
     if not item or str(item.trip.ref.id) != str(actor["trip"].id):
@@ -317,6 +344,7 @@ async def add_expense(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
     paid_by_user = actor.get("actor_user")
     expense = await TripService.add_expense(actor["trip"], payload, paid_by_user=paid_by_user)
     await record_audit(request, actor, "expense.create", {"expense_id": str(expense.id)})
@@ -350,6 +378,7 @@ async def update_expense(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
     from app.models.expense import Expense
     exp = await Expense.get(expense_id)
     if not exp or str(exp.trip.ref.id) != str(actor["trip"].id):
@@ -369,6 +398,7 @@ async def delete_expense(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
     from app.models.expense import Expense
     exp = await Expense.get(expense_id)
     if not exp or str(exp.trip.ref.id) != str(actor["trip"].id):
@@ -386,6 +416,7 @@ async def add_settlement(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
     settlement = await TripService.add_settlement(actor["trip"], payload)
     await record_audit(request, actor, "settlement.create", {"settlement_id": str(settlement.id)})
     return {"id": str(settlement.id)}
@@ -418,6 +449,7 @@ async def update_settlement(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
     from app.models.settlement import Settlement
     s = await Settlement.get(settlement_id)
     if not s or str(s.trip.ref.id) != str(actor["trip"].id):
@@ -445,6 +477,7 @@ async def delete_settlement(
     actor = Depends(resolve_trip_actor("trip_id")),
     request: Request = None,
 ):
+    _require_quicklink_edit(actor)
     from app.models.settlement import Settlement
     s = await Settlement.get(settlement_id)
     if not s or str(s.trip.ref.id) != str(actor["trip"].id):
@@ -452,6 +485,412 @@ async def delete_settlement(
     await s.delete()
     await record_audit(request, actor, "settlement.delete", {"settlement_id": str(settlement_id)})
     return None
+
+
+async def _get_or_create_tripdoc(trip: Trip) -> TripDoc:
+    existing = await TripDoc.find_one(TripDoc.trip.id == trip.id)
+    if existing:
+        return existing
+    # Default doc: mirror core trip fields and members; keep segments empty.
+    members = [
+        {
+            "member_id": str(m.member_id),
+            "display_name": m.display_name,
+            "travel_segments": [],
+            "notes": None,
+        }
+        for m in trip.members
+    ]
+    new_doc = TripDoc(
+        trip=trip,
+        schema_version=2,
+        timezone="UTC",
+        title=trip.name,
+        date_range={"start": None, "end": None},
+        members=members,
+        lodgings=[],
+        natural_language_trip_brief=trip.description or "",
+        shared_notes="",
+        revision=1,
+        updated_at=datetime.utcnow(),
+    )
+    return await new_doc.insert()
+
+
+def _tripdoc_to_response(doc: TripDoc) -> TripDocGetResponse:
+    d = doc.model_dump()
+    # Be explicit: only expose the doc fields we support
+    return TripDocGetResponse(
+        schema_version=d.get("schema_version", 2),
+        timezone=d.get("timezone", "UTC"),
+        title=d.get("title", ""),
+        date_range=d.get("date_range") or {"start": None, "end": None},
+        members=d.get("members") or [],
+        lodgings=d.get("lodgings") or [],
+        natural_language_trip_brief=d.get("natural_language_trip_brief") or "",
+        shared_notes=d.get("shared_notes") or "",
+        revision=d.get("revision") or 1,
+        updated_at=d.get("updated_at"),
+    )
+
+
+@router.get("/{trip_id}/doc", response_model=TripDocGetResponse)
+async def get_trip_doc(
+    trip_id: PydanticObjectId,
+    actor=Depends(resolve_trip_actor("trip_id")),
+):
+    doc = await _get_or_create_tripdoc(actor["trip"])
+    return _tripdoc_to_response(doc)
+
+
+@router.patch("/{trip_id}/doc", response_model=TripDocPatchResponse)
+@limiter.limit("10/minute")
+async def patch_trip_doc(
+    trip_id: PydanticObjectId,
+    payload: TripDocPatchRequest,
+    actor=Depends(resolve_trip_actor("trip_id")),
+    request: Request = None,
+):
+    _require_quicklink_edit(actor)
+    doc = await _get_or_create_tripdoc(actor["trip"])
+    if doc.revision != payload.client_revision:
+        raise HTTPException(status_code=409, detail="Trip doc revision conflict")
+
+    allowed_prefixes = {
+        "/title",
+        "/timezone",
+        "/date_range",
+        "/members",
+        "/lodgings",
+        "/natural_language_trip_brief",
+        "/shared_notes",
+    }
+    patch_ops = [p.model_dump(exclude_none=True) for p in payload.patch]
+    try:
+        validate_patch_paths(patch_ops, allowed_prefixes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Apply patch on a plain dict, validate invariants, then write back allowed fields.
+    doc_dict = doc.model_dump()
+    try:
+        apply_json_patch(doc_dict, patch_ops)
+    except JsonPatchError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Convert known date string fields produced by JSON patch into `date` objects.
+    try:
+        normalize_tripdoc_dates(doc_dict)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid date format in patch values")
+
+    allowed_member_ids = {str(m.member_id) for m in actor["trip"].members}
+    try:
+        validate_tripdoc_invariants(doc_dict, allowed_member_ids)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    for k in [
+        "schema_version",
+        "timezone",
+        "title",
+        "date_range",
+        "members",
+        "lodgings",
+        "natural_language_trip_brief",
+        "shared_notes",
+    ]:
+        setattr(doc, k, doc_dict.get(k))
+    doc.revision += 1
+    doc.updated_at = datetime.utcnow()
+    await doc.save()
+    await record_audit(request, actor, "tripdoc.patch", {"revision": doc.revision})
+    return _tripdoc_to_response(doc)
+
+
+@router.post("/{trip_id}/ai/propose-edits", response_model=AiProposeEditsResponse)
+@limiter.limit("10/minute")
+async def ai_propose_edits(
+    trip_id: PydanticObjectId,
+    payload: AiProposeEditsRequest,
+    actor=Depends(resolve_trip_actor("trip_id")),
+    request: Request = None,
+):
+    # Propose does not mutate DB state (other than issuing a nonce). Quicklink without edit gate is allowed to propose,
+    # but the eventual apply requires X-Trip-Edit: 1.
+    doc = await _get_or_create_tripdoc(actor["trip"])
+
+    from app.models.itinerary import ItineraryItem
+    itinerary = []
+    if payload.edit_itinerary:
+        items = await (
+            ItineraryItem.find(ItineraryItem.trip.id == actor["trip"].id)
+            .sort("start_time")
+            .limit(200)
+            .to_list()
+        )
+        itinerary = [
+            {
+                "id": str(i.id),
+                "title": i.title,
+                "item_type": i.item_type,
+                "start_time": i.start_time.isoformat(),
+                "end_time": i.end_time.isoformat() if i.end_time else None,
+                "location": i.location,
+                "notes": getattr(i, "notes", None),
+                "day_index": getattr(i, "day_index", None),
+                "all_day": getattr(i, "all_day", False),
+                "place_id": getattr(i, "place_id", None),
+                "lat": getattr(i, "lat", None),
+                "lng": getattr(i, "lng", None),
+            }
+            for i in items
+        ]
+
+    client = None
+    try:
+        client = get_openrouter_client()
+    except OpenRouterError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    model = get_openrouter_model()
+    fallback = get_openrouter_fallback_model()
+
+    user_payload = {
+        "task": "edit_trip",
+        "user_request": payload.user_request,
+        "trip_doc": _tripdoc_to_response(doc).model_dump(),
+        "itinerary_items": itinerary,
+    }
+
+    try:
+        result = await client.chat_json(model=model, system_prompt=TRIP_EDITOR_SYSTEM_PROMPT, user_json=user_payload)
+    except Exception as e:
+        if fallback:
+            try:
+                result = await client.chat_json(model=fallback, system_prompt=TRIP_EDITOR_SYSTEM_PROMPT, user_json=user_payload)
+            except Exception as e2:
+                raise HTTPException(status_code=502, detail="AI propose failed")
+        else:
+            raise HTTPException(status_code=502, detail="AI propose failed")
+
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    trip_doc_patch = result.get("trip_doc_patch") or []
+    itinerary_ops = result.get("itinerary_ops") or []
+
+    # Issue a one-time nonce for apply.
+    nonce = secrets.token_urlsafe(32)
+    nonce_doc = TripEditNonce(trip_id=str(actor["trip"].id), nonce=nonce, purpose="ai_apply")
+    await nonce_doc.insert()
+
+    await record_audit(request, actor, "ai.propose", {"has_doc_patch": bool(trip_doc_patch), "ops": len(itinerary_ops)})
+
+    return AiProposeEditsResponse(
+        trip_doc_patch=[JsonPatchOp(**p) for p in trip_doc_patch],
+        itinerary_ops=[ItineraryOp(**o) for o in itinerary_ops],
+        nonce=nonce,
+        nonce_expires_at=nonce_doc.expires_at,
+    )
+
+
+@router.post("/{trip_id}/ai/apply-edits", response_model=AiApplyEditsResponse)
+@limiter.limit("10/minute")
+async def ai_apply_edits(
+    trip_id: PydanticObjectId,
+    payload: AiApplyEditsRequest,
+    actor=Depends(resolve_trip_actor("trip_id")),
+    request: Request = None,
+):
+    _require_quicklink_edit(actor)
+
+    # Validate nonce (one-time, short TTL)
+    nonce_doc = await TripEditNonce.find_one(
+        TripEditNonce.trip_id == str(actor["trip"].id),
+        TripEditNonce.nonce == payload.nonce,
+    )
+    if not nonce_doc or nonce_doc.used_at is not None or nonce_doc.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=403, detail="Invalid or expired nonce")
+    nonce_doc.used_at = datetime.utcnow()
+    await nonce_doc.save()
+
+    doc = await _get_or_create_tripdoc(actor["trip"])
+    if doc.revision != payload.client_revision:
+        raise HTTPException(status_code=409, detail="Trip doc revision conflict")
+
+    allowed_prefixes = {
+        "/title",
+        "/timezone",
+        "/date_range",
+        "/members",
+        "/lodgings",
+        "/natural_language_trip_brief",
+        "/shared_notes",
+    }
+    patch_ops = [p.model_dump(exclude_none=True) for p in payload.trip_doc_patch]
+    try:
+        validate_patch_paths(patch_ops, allowed_prefixes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Apply TripDoc patch if provided
+    if patch_ops:
+        doc_dict = doc.model_dump()
+        try:
+            apply_json_patch(doc_dict, patch_ops)
+        except JsonPatchError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        try:
+            normalize_tripdoc_dates(doc_dict)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid date format in patch values")
+        allowed_member_ids = {str(m.member_id) for m in actor["trip"].members}
+        try:
+            validate_tripdoc_invariants(doc_dict, allowed_member_ids)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        for k in [
+            "schema_version",
+            "timezone",
+            "title",
+            "date_range",
+            "members",
+            "lodgings",
+            "natural_language_trip_brief",
+            "shared_notes",
+        ]:
+            setattr(doc, k, doc_dict.get(k))
+
+    created_ids: List[str] = []
+    updated_ids: List[str] = []
+    deleted_ids: List[str] = []
+
+    from app.models.itinerary import ItineraryItem
+
+    for op in payload.itinerary_ops:
+        if op.op == "create":
+            item = op.item or {}
+            if not item.get("title") or not item.get("item_type") or not item.get("start_time"):
+                raise HTTPException(status_code=400, detail="Invalid itinerary create op")
+            if (item.get("lat") is None) != (item.get("lng") is None):
+                raise HTTPException(status_code=400, detail="lat and lng must be provided together")
+            # Normalize invalid day_index coming from AI (schema requires >= 1).
+            if "day_index" in item:
+                try:
+                    if item["day_index"] is None or int(item["day_index"]) >= 1:
+                        item["day_index"] = int(item["day_index"]) if item["day_index"] is not None else None
+                    else:
+                        item["day_index"] = None
+                except Exception:
+                    item["day_index"] = None
+            start = coerce_to_utc(datetime.fromisoformat(item["start_time"].replace("Z", "+00:00")), assume_tz="UTC")
+            end = None
+            if item.get("end_time"):
+                end = coerce_to_utc(datetime.fromisoformat(item["end_time"].replace("Z", "+00:00")), assume_tz="UTC")
+            try:
+                ensure_end_not_before_start(start, end)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if item.get("all_day"):
+                start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+            try:
+                new_item = ItineraryItem(
+                    trip=actor["trip"],
+                    title=item["title"],
+                    item_type=item["item_type"],
+                    start_time=start,
+                    end_time=end,
+                    location=item.get("location"),
+                    notes=item.get("notes"),
+                    day_index=item.get("day_index"),
+                    all_day=bool(item.get("all_day", False)),
+                    place_id=item.get("place_id"),
+                    lat=item.get("lat"),
+                    lng=item.get("lng"),
+                )
+            except ValidationError as e:
+                raise HTTPException(status_code=400, detail="Invalid itinerary create payload")
+            await new_item.insert()
+            created_ids.append(str(new_item.id))
+
+        elif op.op == "update":
+            if not op.id or not op.set:
+                raise HTTPException(status_code=400, detail="Invalid itinerary update op")
+            item = await ItineraryItem.get(PydanticObjectId(op.id))
+            if not item or str(item.trip.ref.id) != str(actor["trip"].id):
+                raise HTTPException(status_code=404, detail="Itinerary item not found")
+
+            update_data = {k: v for k, v in (op.set or {}).items() if v is not None}
+            # Normalize invalid day_index coming from AI (schema requires >= 1).
+            if "day_index" in update_data:
+                try:
+                    di = update_data.get("day_index")
+                    if di is None:
+                        pass
+                    elif int(di) >= 1:
+                        update_data["day_index"] = int(di)
+                    else:
+                        # Ignore invalid values instead of 500'ing
+                        update_data.pop("day_index", None)
+                except Exception:
+                    update_data.pop("day_index", None)
+            merged_lat = update_data.get("lat", getattr(item, "lat", None))
+            merged_lng = update_data.get("lng", getattr(item, "lng", None))
+            if (merged_lat is None) != (merged_lng is None):
+                raise HTTPException(status_code=400, detail="lat and lng must be provided together")
+
+            if "start_time" in update_data:
+                start = coerce_to_utc(datetime.fromisoformat(str(update_data["start_time"]).replace("Z", "+00:00")), assume_tz="UTC")
+                update_data["start_time"] = start
+            else:
+                start = coerce_to_utc(item.start_time, assume_tz="UTC")
+
+            if "end_time" in update_data:
+                end_val = update_data["end_time"]
+                end = coerce_to_utc(datetime.fromisoformat(str(end_val).replace("Z", "+00:00")), assume_tz="UTC") if end_val else None
+                update_data["end_time"] = end
+            else:
+                end = coerce_to_utc(item.end_time, assume_tz="UTC") if item.end_time else None
+
+            merged_all_day = update_data.get("all_day", getattr(item, "all_day", False))
+            if merged_all_day and start:
+                start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+                update_data["start_time"] = start
+            try:
+                ensure_end_not_before_start(start, end)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            for k, v in update_data.items():
+                setattr(item, k, v)
+            await item.save()
+            updated_ids.append(str(item.id))
+
+        elif op.op == "delete":
+            if not op.id:
+                raise HTTPException(status_code=400, detail="Invalid itinerary delete op")
+            item = await ItineraryItem.get(PydanticObjectId(op.id))
+            if not item or str(item.trip.ref.id) != str(actor["trip"].id):
+                raise HTTPException(status_code=404, detail="Itinerary item not found")
+            await item.delete()
+            deleted_ids.append(op.id)
+
+    doc.revision += 1
+    doc.updated_at = datetime.utcnow()
+    await doc.save()
+    await record_audit(
+        request,
+        actor,
+        "ai.apply",
+        {"doc_patched": bool(patch_ops), "created": len(created_ids), "updated": len(updated_ids), "deleted": len(deleted_ids), "revision": doc.revision},
+    )
+
+    return AiApplyEditsResponse(
+        trip_doc=_tripdoc_to_response(doc),
+        created_itinerary_ids=created_ids,
+        updated_itinerary_ids=updated_ids,
+        deleted_itinerary_ids=deleted_ids,
+    )
 
 
 @router.get("/{trip_id}/balances", response_model=List[BalanceEntry])
@@ -575,7 +1014,11 @@ async def list_itinerary(
     actor = Depends(resolve_trip_actor("trip_id")),
 ):
     from app.models.itinerary import ItineraryItem
-    items = await ItineraryItem.find(ItineraryItem.trip.id == actor["trip"].id).to_list()
+    items = await (
+        ItineraryItem.find(ItineraryItem.trip.id == actor["trip"].id)
+        .sort("start_time")
+        .to_list()
+    )
     return [
         ItineraryItemRead(
             id=i.id,
@@ -584,6 +1027,12 @@ async def list_itinerary(
             start_time=i.start_time,
             end_time=i.end_time,
             location=i.location,
+            notes=getattr(i, "notes", None),
+            day_index=getattr(i, "day_index", None),
+            all_day=getattr(i, "all_day", False),
+            place_id=getattr(i, "place_id", None),
+            lat=getattr(i, "lat", None),
+            lng=getattr(i, "lng", None),
         )
         for i in items
     ]

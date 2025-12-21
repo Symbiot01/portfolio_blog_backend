@@ -66,6 +66,12 @@ class TripService:
             start_time=data.start_time,
             end_time=data.end_time,
             location=data.location,
+            notes=getattr(data, "notes", None),
+            day_index=getattr(data, "day_index", None),
+            all_day=getattr(data, "all_day", False),
+            place_id=getattr(data, "place_id", None),
+            lat=getattr(data, "lat", None),
+            lng=getattr(data, "lng", None),
         )
         return await item.insert()
 

@@ -25,3 +25,6 @@ cloudinary==1.44.1
 
 # Blog slugs (provides `from slugify import slugify`)
 python-slugify==8.0.4
+
+# HTTP client (OpenRouter integration)
+httpx==0.28.1
