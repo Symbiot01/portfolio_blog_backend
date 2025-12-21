@@ -16,11 +16,30 @@ from app.admin.router import router as admin_router
 from app.tripsync.router import router as tripsync_router
 from app.core.database import initialize_database
 
+import signal
+import asyncio
+from contextlib import asynccontextmanager
+
 limiter = Limiter(key_func=get_remote_address)
+
+_client = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await initialize_database()
+    yield
+    # Shutdown - cleanup connections
+    from app.core.database import get_client
+    client = get_client()
+    if client:
+        client.close()
+        await asyncio.sleep(0.5)  # Give time for cleanup
 
 app = FastAPI(
     title="Portfolio & Blog API",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan  # Replace @app.on_event("startup")
 )
 
 app.state.limiter = limiter
