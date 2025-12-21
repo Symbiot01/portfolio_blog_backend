@@ -13,6 +13,8 @@ class ActorContext(TypedDict, total=False):
     actor_user: Optional[User]
     actor_member_id: Optional[str]
     source: Literal["login", "quicklink"]
+    can_edit: bool
+    can_ai_edit: bool
 
 
 def resolve_trip_actor(param_trip_id: str):
@@ -39,6 +41,8 @@ def resolve_trip_actor(param_trip_id: str):
                     "actor_user": user,
                     "actor_member_id": str(linked_member.member_id),
                     "source": "login",
+                    "can_edit": True,
+                    "can_ai_edit": True,
                 }
             # Not a linked member → fall through to quicklink if provided
 
@@ -61,6 +65,9 @@ def resolve_trip_actor(param_trip_id: str):
         if not token_matches:
             raise HTTPException(status_code=403, detail="Invalid access token for this trip")
 
+        # Explicit edit gate for quicklink-based mutations (prevents accidental writes with just a shared URL).
+        quicklink_edit_enabled = request.headers.get("X-Trip-Edit") == "1"
+
         # Optional attribution via member id header/query
         as_member_id = request.headers.get("X-Trip-As-Member") or request.query_params.get("as_member_id")
         actor_member_id: Optional[str] = None
@@ -74,6 +81,8 @@ def resolve_trip_actor(param_trip_id: str):
             "actor_user": None,
             "actor_member_id": actor_member_id,
             "source": "quicklink",
+            "can_edit": quicklink_edit_enabled,
+            "can_ai_edit": quicklink_edit_enabled,
         }
 
     return _resolver

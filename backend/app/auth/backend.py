@@ -7,9 +7,6 @@ from fastapi_users.authentication import (
 )
 
 SECRET = os.getenv("SECRET_KEY")
-if not SECRET:
-    # Fail fast in production instead of returning 500 during login.
-    raise RuntimeError("SECRET_KEY environment variable is required for JWT auth")
 
 # This URL tells the frontend where to send the username and password for login
 bearer_transport = BearerTransport(tokenUrl="api/auth/jwt/login")

@@ -1,5 +1,11 @@
 import unittest
 
+import os
+import sys
+
+# Ensure `backend/` is on sys.path so `import app.*` works when running tests from repo root.
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from app.tripsync.balance_math import apply_settlement
 
 
