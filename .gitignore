@@ -1,5 +1,7 @@
 # Virtual Environment
 venv/
+.venv/
+backend/.venv/
 __pycache__/
 *.pyc
 
@@ -10,6 +12,9 @@ __pycache__/
 
 # Environment files
 .env
+.env.*
+backend/.env
+backend/.env.*
 
 # Logs (Ignore this if youare a developer just my thing)
 codecache.txt
