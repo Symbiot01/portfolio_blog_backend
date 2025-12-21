@@ -253,6 +253,14 @@
 
   Base path: `/api/tripsync`
 
+  ### Quicklink edit gate (important)
+
+  If you are using a trip access link (quicklink), reads are allowed with:
+  - Header: `X-Trip-Access: <token>` (or query `access_token=<token>`)
+
+  **Writes require an explicit edit opt-in** to prevent accidental modifications via shared links:
+  - Header: `X-Trip-Edit: 1`
+
   ### POST `/api/tripsync/`
 
   Create a new trip.
@@ -333,7 +341,12 @@
     "start_time": "2024-07-15T10:00:00",
     "end_time": "2024-07-15T12:00:00",
     "location": "Paris, France",
-    "notes": "Don't forget tickets"
+    "notes": "Don't forget tickets",
+    "day_index": 2,
+    "all_day": false,
+    "place_id": "ChIJLU7jZClu5kcR4PcOOO6p3I0",
+    "lat": 48.8584,
+    "lng": 2.2945
   }
   ```
 
@@ -370,7 +383,59 @@ List all itinerary items for a trip.
 
 **Authentication:** Required (must be a member or have access token)
 
-**Response:** `List[ItineraryItemRead]`
+**Response:** `List[ItineraryItemRead]` (sorted by `start_time` ascending)
+
+  ### Timezone expectations (itinerary)
+
+  - API accepts ISO 8601 datetimes.
+  - Backend normalizes times to **UTC** internally and returns ISO 8601.
+  - For all-day items, set `all_day=true` and backend will align `start_time` to midnight UTC.
+
+  ### TripDoc (AI + human editable trip details)
+
+  ### GET `/api/tripsync/{trip_id}/doc`
+
+  Returns the per-trip TripDoc (created automatically if missing).
+
+  **Authentication:** Required (must be a member or have access token)
+
+  **Response:** `TripDocGetResponse`
+
+  ### PATCH `/api/tripsync/{trip_id}/doc`
+
+  Apply a restricted JSON Patch to TripDoc. Uses optimistic concurrency via `client_revision`.
+
+  **Authentication:** Required (must be a member or have access token + `X-Trip-Edit: 1`)
+
+  **Rate Limit:** 10/minute
+
+  **Request Body:** `TripDocPatchRequest`
+
+  **Response:** `TripDocPatchResponse`
+
+  ### POST `/api/tripsync/{trip_id}/ai/propose-edits`
+
+  Ask AI to propose changes to TripDoc + itinerary. Returns proposed `trip_doc_patch` + `itinerary_ops` plus a one-time `nonce` required for apply.
+
+  **Authentication:** Required (must be a member or have access token)
+
+  **Rate Limit:** 10/minute
+
+  **Request Body:** `AiProposeEditsRequest`
+
+  **Response:** `AiProposeEditsResponse`
+
+  ### POST `/api/tripsync/{trip_id}/ai/apply-edits`
+
+  Apply AI-proposed changes (requires `nonce`, `client_revision`, and `X-Trip-Edit: 1` for quicklink).
+
+  **Authentication:** Required (must be a member or have access token + `X-Trip-Edit: 1`)
+
+  **Rate Limit:** 10/minute
+
+  **Request Body:** `AiApplyEditsRequest`
+
+  **Response:** `AiApplyEditsResponse`
 
   ### POST `/api/tripsync/{trip_id}/expenses`
 

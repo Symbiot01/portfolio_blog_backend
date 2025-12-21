@@ -1,8 +1,8 @@
 # FILE: ./app/tripsync/schemas.py (NEW FILE)
 from pydantic import BaseModel, Field
 from beanie import PydanticObjectId
-from typing import List, Optional, Literal
-from datetime import datetime
+from typing import Any, Dict, List, Optional, Literal
+from datetime import datetime, date
 
 # --- Trip Schemas ---
 class TripCreate(BaseModel):
@@ -35,6 +35,12 @@ class ItineraryItemCreate(BaseModel):
     start_time: datetime
     end_time: Optional[datetime] = None
     location: Optional[str] = None
+    notes: Optional[str] = Field(default=None, max_length=2000)
+    day_index: Optional[int] = Field(default=None, ge=1)
+    all_day: bool = False
+    place_id: Optional[str] = Field(default=None, max_length=200)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    lng: Optional[float] = Field(default=None, ge=-180, le=180)
 
 class ItineraryItemRead(ItineraryItemCreate):
     id: PydanticObjectId
@@ -59,7 +65,12 @@ class ItineraryItemUpdate(BaseModel):
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     location: Optional[str] = None
-    notes: Optional[str] = None
+    notes: Optional[str] = Field(default=None, max_length=2000)
+    day_index: Optional[int] = Field(default=None, ge=1)
+    all_day: Optional[bool] = None
+    place_id: Optional[str] = Field(default=None, max_length=200)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    lng: Optional[float] = Field(default=None, ge=-180, le=180)
 
 class ExpenseUpdate(BaseModel):
     description: Optional[str] = None
@@ -98,3 +109,67 @@ class TripLinkInfo(BaseModel):
     link_revoked: bool
     link_expires_at: Optional[datetime] = None
     access_token_version: int
+
+
+# --- TripDoc + AI edit schemas ---
+class JsonPatchOp(BaseModel):
+    op: Literal["add", "remove", "replace"]
+    path: str
+    value: Optional[Any] = None
+
+
+class TripDocGetResponse(BaseModel):
+    schema_version: int
+    timezone: str
+    title: str
+    date_range: Dict[str, Optional[date]]
+    members: List[Dict[str, Any]]
+    lodgings: List[Dict[str, Any]]
+    natural_language_trip_brief: str
+    shared_notes: str
+    revision: int
+    updated_at: datetime
+
+
+class TripDocPatchRequest(BaseModel):
+    patch: List[JsonPatchOp]
+    client_revision: int = Field(..., ge=1)
+
+
+class TripDocPatchResponse(TripDocGetResponse):
+    pass
+
+
+class ItineraryOp(BaseModel):
+    op: Literal["create", "update", "delete"]
+    id: Optional[str] = None
+    temp_id: Optional[str] = None
+    item: Optional[Dict[str, Any]] = None
+    set: Optional[Dict[str, Any]] = None
+
+
+class AiProposeEditsRequest(BaseModel):
+    user_request: str = Field(..., max_length=4000)
+    edit_doc: bool = True
+    edit_itinerary: bool = True
+
+
+class AiProposeEditsResponse(BaseModel):
+    trip_doc_patch: List[JsonPatchOp] = Field(default_factory=list)
+    itinerary_ops: List[ItineraryOp] = Field(default_factory=list)
+    nonce: str
+    nonce_expires_at: datetime
+
+
+class AiApplyEditsRequest(BaseModel):
+    trip_doc_patch: List[JsonPatchOp] = Field(default_factory=list)
+    itinerary_ops: List[ItineraryOp] = Field(default_factory=list)
+    client_revision: int = Field(..., ge=1)
+    nonce: str
+
+
+class AiApplyEditsResponse(BaseModel):
+    trip_doc: TripDocGetResponse
+    created_itinerary_ids: List[str] = Field(default_factory=list)
+    updated_itinerary_ids: List[str] = Field(default_factory=list)
+    deleted_itinerary_ids: List[str] = Field(default_factory=list)
