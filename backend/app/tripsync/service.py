@@ -77,12 +77,27 @@ class TripService:
 
     @staticmethod
     async def add_expense(trip: Trip, data: ExpenseCreate, paid_by_user: Optional[User]) -> Expense:
+        if data.split_type == "exact":
+            if not data.custom_splits:
+                raise HTTPException(status_code=400, detail="custom_splits must be provided for exact split type")
+            
+            total_custom_amount = sum(cs.amount for cs in data.custom_splits)
+            if not math.isclose(total_custom_amount, data.amount, rel_tol=1e-9, abs_tol=0.01):
+                raise HTTPException(status_code=400, detail="Sum of custom splits must equal the total amount")
+            
+            member_ids = {str(m.member_id) for m in trip.members}
+            for cs in data.custom_splits:
+                if cs.member_id not in member_ids:
+                    raise HTTPException(status_code=400, detail=f"Member {cs.member_id} is not part of this trip")
+
         expense = Expense(
             trip=trip,
             description=data.description,
             amount=data.amount,
             paid_by_member_id=data.paid_by_member_id,
             split_with_member_ids=data.split_with_member_ids,
+            split_type=data.split_type,
+            custom_splits=data.custom_splits,
         )
         return await expense.insert()
 
@@ -103,17 +118,25 @@ class TripService:
         member_ids = [str(m.member_id) for m in trip.members]
         balance_map = {mid: 0.0 for mid in member_ids}
 
-        # Expenses: each split_with member owes amount / len(split_with)
+        # Expenses
         expenses = await Expense.find(Expense.trip.id == trip.id).to_list()
         for e in expenses:
-            if not e.split_with_member_ids:
-                continue
-            share = e.amount / len(e.split_with_member_ids)
             # Payer gets credited full amount initially
             balance_map[e.paid_by_member_id] = balance_map.get(e.paid_by_member_id, 0.0) + e.amount
-            # Each participant owes their share
-            for mid in e.split_with_member_ids:
-                balance_map[mid] = balance_map.get(mid, 0.0) - share
+
+            split_type = getattr(e, "split_type", "equal")
+
+            if split_type == "exact":
+                custom_splits = getattr(e, "custom_splits", [])
+                for cs in custom_splits:
+                    balance_map[cs.member_id] = balance_map.get(cs.member_id, 0.0) - cs.amount
+            else:
+                if not e.split_with_member_ids:
+                    continue
+                share = e.amount / len(e.split_with_member_ids)
+                # Each participant owes their share
+                for mid in e.split_with_member_ids:
+                    balance_map[mid] = balance_map.get(mid, 0.0) - share
 
         # Settlements: payer pays payee (see balance_math.apply_settlement for sign convention).
         settlements = await Settlement.find(Settlement.trip.id == trip.id).to_list()

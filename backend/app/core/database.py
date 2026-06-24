@@ -28,7 +28,7 @@ async def initialize_database():
     db_name = os.getenv("DATABASE_NAME")
     
     await init_beanie(
-        database=client.get_database(db_name),
+        database=_client.get_database(db_name),
         document_models=[
             User,
             BlogPost,
