@@ -97,7 +97,7 @@ class TripService:
             paid_by_member_id=data.paid_by_member_id,
             split_with_member_ids=data.split_with_member_ids,
             split_type=data.split_type,
-            custom_splits=data.custom_splits,
+            custom_splits=[cs.dict() for cs in data.custom_splits] if data.custom_splits else [],
         )
         return await expense.insert()
 
@@ -129,7 +129,10 @@ class TripService:
             if split_type == "exact":
                 custom_splits = getattr(e, "custom_splits", [])
                 for cs in custom_splits:
-                    balance_map[cs.member_id] = balance_map.get(cs.member_id, 0.0) - cs.amount
+                    member_id = cs.get("member_id") if isinstance(cs, dict) else getattr(cs, "member_id", None)
+                    amount = cs.get("amount") if isinstance(cs, dict) else getattr(cs, "amount", 0.0)
+                    if member_id:
+                        balance_map[member_id] = balance_map.get(member_id, 0.0) - amount
             else:
                 if not e.split_with_member_ids:
                     continue
