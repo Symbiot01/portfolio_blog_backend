@@ -367,6 +367,8 @@ async def get_expense(
         "amount": exp.amount,
         "paid_by_member_id": exp.paid_by_member_id,
         "split_with_member_ids": exp.split_with_member_ids,
+        "split_type": getattr(exp, "split_type", "equal"),
+        "custom_splits": getattr(exp, "custom_splits", []),
     }
 
 @router.patch("/{trip_id}/expenses/{expense_id}")
@@ -380,10 +382,30 @@ async def update_expense(
 ):
     _require_quicklink_edit(actor)
     from app.models.expense import Expense
+    import math
     exp = await Expense.get(expense_id)
     if not exp or str(exp.trip.ref.id) != str(actor["trip"].id):
         raise HTTPException(status_code=404, detail="Expense not found")
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+
+    merged_split_type = update_data.get("split_type", getattr(exp, "split_type", "equal"))
+    if merged_split_type == "exact":
+        merged_amount = update_data.get("amount", exp.amount)
+        merged_custom_splits = update_data.get("custom_splits", getattr(exp, "custom_splits", []))
+        
+        if not merged_custom_splits:
+            raise HTTPException(status_code=400, detail="custom_splits must be provided for exact split type")
+            
+        total_custom_amount = sum(cs["amount"] if isinstance(cs, dict) else getattr(cs, "amount", 0.0) for cs in merged_custom_splits)
+        if not math.isclose(total_custom_amount, merged_amount, rel_tol=1e-9, abs_tol=0.01):
+            raise HTTPException(status_code=400, detail="Sum of custom splits must equal the total amount")
+            
+        member_ids = {str(m.member_id) for m in actor["trip"].members}
+        for cs in merged_custom_splits:
+            m_id = cs["member_id"] if isinstance(cs, dict) else getattr(cs, "member_id", "")
+            if m_id not in member_ids:
+                raise HTTPException(status_code=400, detail=f"Member {m_id} is not part of this trip")
+
     for k, v in update_data.items():
         setattr(exp, k, v)
     await exp.save()
@@ -1051,6 +1073,8 @@ async def list_expenses(
             amount=e.amount,
             paid_by_member_id=e.paid_by_member_id,
             split_with_member_ids=e.split_with_member_ids,
+            split_type=getattr(e, "split_type", "equal"),
+            custom_splits=getattr(e, "custom_splits", []),
         )
         for e in exps
     ]

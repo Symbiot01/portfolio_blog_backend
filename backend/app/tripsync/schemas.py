@@ -46,11 +46,17 @@ class ItineraryItemRead(ItineraryItemCreate):
     id: PydanticObjectId
 
 # --- Expense Schemas ---
+class CustomSplit(BaseModel):
+    member_id: str
+    amount: float
+
 class ExpenseCreate(BaseModel):
     description: str = Field(..., max_length=150)
     amount: float
     paid_by_member_id: str
-    split_with_member_ids: List[str]
+    split_with_member_ids: Optional[List[str]] = Field(default_factory=list)
+    split_type: Literal["equal", "exact"] = "equal"
+    custom_splits: Optional[List[CustomSplit]] = Field(default_factory=list)
 
 class ExpenseRead(BaseModel):
     id: PydanticObjectId
@@ -58,6 +64,8 @@ class ExpenseRead(BaseModel):
     amount: float
     paid_by_member_id: str
     split_with_member_ids: List[str]
+    split_type: Literal["equal", "exact"]
+    custom_splits: List[CustomSplit]
 
 class ItineraryItemUpdate(BaseModel):
     title: Optional[str] = None
@@ -77,6 +85,8 @@ class ExpenseUpdate(BaseModel):
     amount: Optional[float] = None
     paid_by_member_id: Optional[str] = None
     split_with_member_ids: Optional[List[str]] = None
+    split_type: Optional[Literal["equal", "exact"]] = None
+    custom_splits: Optional[List[CustomSplit]] = None
 
 class SettlementCreate(BaseModel):
     payer_member_id: str
