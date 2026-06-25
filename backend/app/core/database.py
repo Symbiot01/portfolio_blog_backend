@@ -12,15 +12,23 @@ from app.models.trip_doc import TripDoc
 from app.models.trip_audit import TripAuditEvent
 from app.models.trip_edit_nonce import TripEditNonce
 
+_client = None
+
 async def initialize_database():
     """Initializes the Beanie ODM and connects to the database."""
-    # Beanie v2 uses PyMongo's native async client (NOT Motor).
-    # Mixing Motor with Beanie v2 breaks link fetching (e.g. fetch_links=True) at runtime.
-    client = AsyncMongoClient(os.getenv("DATABASE_URL"))
+    global _client
+    _client = AsyncMongoClient(
+        os.getenv("DATABASE_URL"),
+        maxPoolSize=10,
+        minPoolSize=2,
+        maxIdleTimeMS=30000,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+    )
     db_name = os.getenv("DATABASE_NAME")
     
     await init_beanie(
-        database=client.get_database(db_name),
+        database=_client.get_database(db_name),
         document_models=[
             User,
             BlogPost,
@@ -34,3 +42,7 @@ async def initialize_database():
             TripEditNonce,
         ]
     )
+
+def get_client():
+    """Get the MongoDB client for cleanup."""
+    return _client
