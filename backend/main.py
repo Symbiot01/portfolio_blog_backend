@@ -14,6 +14,7 @@ from app.auth.router import router as auth_router
 from app.uploads.router import router as uploads_router
 from app.admin.router import router as admin_router
 from app.tripsync.router import router as tripsync_router
+from app.wishlist.adapters.http.router import router as wishlist_router
 from app.core.database import initialize_database
 
 import signal
@@ -63,7 +64,8 @@ app.include_router(auth_router, prefix="/api/auth")
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
 app.include_router(blog_router, prefix="/api/blog", tags=["Blog"])
 app.include_router(uploads_router, prefix="/api/uploads", tags=["Uploads"])
-app.include_router(tripsync_router, prefix="/api/tripsync", tags=["TripSync"])  
+app.include_router(tripsync_router, prefix="/api/tripsync", tags=["TripSync"])
+app.include_router(wishlist_router, prefix="/api/wishlist", tags=["Wishlist"])
 
 @app.get("/api/health")
 @limiter.limit("5/minute")
