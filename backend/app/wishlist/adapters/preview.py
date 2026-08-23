@@ -409,6 +409,7 @@ class HttpScrapePreview:
                     raise ValidationError(
                         "could not extract product details; enter title, image, and price manually"
                     )
+                draft.setdefault("image_candidates", [])
                 draft["source"] = "http_scrape"
                 return draft
 
