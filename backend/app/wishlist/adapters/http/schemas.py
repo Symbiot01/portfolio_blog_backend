@@ -103,6 +103,8 @@ class ProductRead(BaseModel):
     status: str
     created_by_actor_key: str
     reservation: Optional[ReservationInfo] = None
+    # Present when the server minted a guest id for this mutation (share-link actors).
+    guest_id: Optional[str] = None
 
 
 class ReserveRequest(BaseModel):

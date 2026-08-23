@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+import secrets
+from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from slowapi import Limiter
@@ -34,7 +35,7 @@ from app.wishlist.adapters.http.schemas import (
     UrlPreviewIn,
     UrlPreviewOut,
 )
-from app.wishlist.domain.actor import MemberActor
+from app.wishlist.domain.actor import GuestActor, MemberActor, WishlistActor
 from app.wishlist.domain.errors import (
     AlreadyReserved,
     CannotReserveOwnList,
@@ -89,6 +90,19 @@ def _http_from_domain(exc: WishlistError) -> HTTPException:
             status = code
             break
     return HTTPException(status_code=status, detail=exc.message)
+
+
+def _ensure_guest_actor(actor: WishlistActor) -> Tuple[WishlistActor, Optional[str]]:
+    """
+    Share-link guests need a stable guest_id for create/edit attribution.
+    Mint one when the client has not sent X-Wishlist-Guest yet.
+    """
+    if not isinstance(actor, GuestActor):
+        return actor, None
+    if actor.guest_id:
+        return actor, None
+    issued = secrets.token_urlsafe(32)
+    return GuestActor(guest_id=issued, display_name=actor.display_name), issued
 
 
 def _group_to_read(
@@ -400,6 +414,7 @@ async def add_product(
     ctx: ActorContext = Depends(resolve_wishlist_actor),
     container: Container = Depends(get_wishlist_container),
 ):
+    actor, issued_guest = _ensure_guest_actor(ctx["actor"])
     try:
         product = await container.add_product(
             group_id=group_id,
@@ -407,7 +422,7 @@ async def add_product(
             title=payload.title,
             description=payload.description,
             options=[o.model_dump() for o in payload.options],
-            actor=ctx["actor"],
+            actor=actor,
         )
     except WishlistError as e:
         raise _http_from_domain(e)
@@ -431,6 +446,8 @@ async def add_product(
         ],
         status=product.status.value,
         created_by_actor_key=product.created_by_actor_key,
+        guest_id=issued_guest
+        or (actor.guest_id if isinstance(actor, GuestActor) else None),
     )
 
 
