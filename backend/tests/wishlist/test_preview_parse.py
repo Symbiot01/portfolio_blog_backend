@@ -87,3 +87,18 @@ def test_assert_safe_url_rejects_private_ip_literal():
         assert_safe_public_url("http://192.168.1.10/x")
     with pytest.raises(ValidationError):
         assert_safe_public_url("http://169.254.169.254/latest/meta-data")
+
+
+def test_amazon_host_and_bot_wall_helpers():
+    from app.wishlist.adapters.preview import (
+        _fetch_blocked_message,
+        _is_amazon_host,
+        _looks_like_bot_wall,
+    )
+
+    assert _is_amazon_host("amzn.in")
+    assert _is_amazon_host("www.amazon.in")
+    assert not _is_amazon_host("pantproject.com")
+    assert _looks_like_bot_wall("<html>Click Continue shopping to proceed</html>")
+    msg = _fetch_blocked_message("https://amzn.in/d/abc", 500)
+    assert "Amazon blocks" in msg

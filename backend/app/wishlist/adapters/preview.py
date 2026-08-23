@@ -16,11 +16,30 @@ import httpx
 from app.wishlist.domain.errors import ValidationError
 
 _MAX_BYTES = 512_000  # hard cap — product meta is almost always in the first chunk / <head>
-_DEFAULT_TIMEOUT = 8.0
-_MAX_REDIRECTS = 3
+_DEFAULT_TIMEOUT = 10.0
+_MAX_REDIRECTS = 8
 _HEAD_END = re.compile(rb"</head\s*>", re.IGNORECASE)
 # Keep a little body after </head> for stores that put JSON-LD just below it.
 _POST_HEAD_SLACK = 64_000
+_BOT_WALL_HINTS = (
+    "continue shopping",
+    "robot check",
+    "enter the characters you see",
+    "api-services-support@amazon",
+    "not a robot",
+    "automated access",
+)
+_AMAZON_HOST_SUFFIXES = (
+    "amazon.com",
+    "amazon.in",
+    "amazon.co.uk",
+    "amazon.de",
+    "amazon.ca",
+    "amazon.com.au",
+    "amzn.in",
+    "amzn.to",
+    "a.co",
+)
 
 _META_PROP = re.compile(
     r'<meta[^>]+(?:property|name)\s*=\s*["\']([^"\']+)["\'][^>]+content\s*=\s*["\']([^"\']*)["\']',
@@ -63,8 +82,8 @@ def _user_agent() -> str:
     return os.getenv(
         "WISHLIST_PREVIEW_USER_AGENT",
         (
-            "Mozilla/5.0 (compatible; WishlistPreviewBot/1.1; "
-            "+https://wishlist.local; product-metadata-preview)"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         ),
     ).strip()
 
@@ -73,6 +92,29 @@ def _draft_has_signal(draft: Dict[str, Any]) -> bool:
     return bool(
         draft.get("title") or draft.get("image_url") or draft.get("price") is not None
     )
+
+
+def _is_amazon_host(hostname: Optional[str]) -> bool:
+    host = (hostname or "").lower().rstrip(".")
+    return any(host == s or host.endswith("." + s) for s in _AMAZON_HOST_SUFFIXES)
+
+
+def _looks_like_bot_wall(html_text: str) -> bool:
+    lowered = (html_text or "")[:8000].lower()
+    return any(hint in lowered for hint in _BOT_WALL_HINTS)
+
+
+def _fetch_blocked_message(url: str, status: Optional[int] = None) -> str:
+    host = urlparse(url).hostname
+    if _is_amazon_host(host):
+        return (
+            "Amazon blocks automated previews for short/share links. "
+            "Open the product in a browser, copy the full amazon.in/dp/… URL, "
+            "or enter title, image, and price manually."
+        )
+    if status is not None:
+        return f"could not fetch url (HTTP {status})"
+    return "could not fetch url; enter details manually"
 
 
 def _read_enough_html(buf: bytearray) -> bool:
@@ -297,10 +339,15 @@ class HttpScrapePreview:
         timeout = httpx.Timeout(_timeout_s(), connect=min(5.0, _timeout_s()))
         headers = {
             "User-Agent": _user_agent(),
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.8",
-            # Prefer identity so early-exit byte counts match uncompressed HTML.
-            "Accept-Encoding": "identity",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+            # Allow gzip — some CDNs (Amazon) 4xx/5xx when forced to identity.
+            "Accept-Encoding": "gzip, deflate",
+            "Cache-Control": "no-cache",
+            "Upgrade-Insecure-Requests": "1",
         }
 
         async with httpx.AsyncClient(
@@ -310,6 +357,7 @@ class HttpScrapePreview:
             max_redirects=0,
         ) as client:
             for _ in range(_MAX_REDIRECTS + 1):
+                body = b""
                 try:
                     async with client.stream("GET", current) as resp:
                         # Manual redirect handling with SSRF re-check
@@ -323,7 +371,7 @@ class HttpScrapePreview:
 
                         if resp.status_code >= 400:
                             raise ValidationError(
-                                f"could not fetch url (HTTP {resp.status_code})"
+                                _fetch_blocked_message(current, resp.status_code)
                             )
 
                         ctype = (resp.headers.get("content-type") or "").lower()
@@ -340,17 +388,24 @@ class HttpScrapePreview:
                                 # Drop the connection early — do not download the full page.
                                 break
                         body = bytes(buf)
+                except ValidationError:
+                    raise
                 except httpx.TimeoutException as e:
                     raise ValidationError("preview timed out; enter details manually") from e
                 except httpx.HTTPError as e:
-                    raise ValidationError("could not fetch url; enter details manually") from e
+                    raise ValidationError(_fetch_blocked_message(current)) from e
 
                 if not body:
                     raise ValidationError("empty response; enter details manually")
 
                 text = body.decode("utf-8", errors="replace")
+                if _looks_like_bot_wall(text):
+                    raise ValidationError(_fetch_blocked_message(current))
+
                 draft = parse_product_html(text, current)
                 if not _draft_has_signal(draft):
+                    if _is_amazon_host(urlparse(current).hostname):
+                        raise ValidationError(_fetch_blocked_message(current))
                     raise ValidationError(
                         "could not extract product details; enter title, image, and price manually"
                     )
