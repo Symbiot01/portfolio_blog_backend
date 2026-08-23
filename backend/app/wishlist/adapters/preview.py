@@ -415,7 +415,39 @@ class HttpScrapePreview:
         raise ValidationError("too many redirects")
 
 
-def build_preview_adapter() -> NullPreview | HttpScrapePreview:
-    if _preview_enabled():
-        return HttpScrapePreview()
-    return NullPreview()
+class ChainedPreview:
+    """Try primary scrape, then optional AI fallbacks."""
+
+    def __init__(self, primary: Any, *fallbacks: Any) -> None:
+        self.primary = primary
+        self.fallbacks = [f for f in fallbacks if f is not None]
+
+    async def from_url(self, url: str) -> Dict[str, Any]:
+        try:
+            return await self.primary.from_url(url)
+        except ValidationError as first_err:
+            last = first_err
+            for fb in self.fallbacks:
+                try:
+                    return await fb.from_url(url)
+                except ValidationError as e:
+                    last = e
+            raise last
+
+
+def build_preview_adapter() -> Any:
+    if not _preview_enabled():
+        return NullPreview()
+    primary = HttpScrapePreview()
+    fallbacks: List[Any] = []
+    # Lazy import avoids hard dependency cycle / unused path when no key.
+    try:
+        from app.wishlist.adapters.gemini_preview import GeminiPreview, _gemini_enabled
+
+        if _gemini_enabled():
+            fallbacks.append(GeminiPreview())
+    except Exception:
+        pass
+    if not fallbacks:
+        return primary
+    return ChainedPreview(primary, *fallbacks)
