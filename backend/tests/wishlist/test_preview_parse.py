@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from app.wishlist.adapters.preview import assert_safe_public_url, parse_product_html
+from app.wishlist.adapters.preview import (
+    _read_enough_html,
+    assert_safe_public_url,
+    parse_product_html,
+)
 from app.wishlist.domain.errors import ValidationError
 
 
@@ -44,6 +48,26 @@ def test_parse_jsonld_when_og_missing():
     assert draft["image_url"] == "https://cdn.example/bose.png"
     assert draft["price"] == 429.0
     assert draft["currency"] == "EUR"
+
+
+def test_parse_works_on_head_only_truncation():
+    """Fetcher stops after </head>; huge bodies must not be required."""
+    head_only = SAMPLE_HTML.split("</head>")[0] + "</head>"
+    draft = parse_product_html(head_only, "https://store.example.com/p/1")
+    assert draft["title"] == "Sony WH-1000XM5"
+    assert draft["price"] == 349.99
+
+
+def test_read_enough_stops_after_head_plus_slack():
+    head = b"<html><head><title>x</title></head>"
+    assert _read_enough_html(bytearray(head)) is False  # need slack unless cap
+    padded = bytearray(head + (b"y" * 70_000))
+    assert _read_enough_html(padded) is True
+
+
+def test_read_enough_stops_at_hard_cap():
+    buf = bytearray(b"a" * 520_000)
+    assert _read_enough_html(buf) is True
 
 
 def test_assert_safe_url_rejects_non_http():

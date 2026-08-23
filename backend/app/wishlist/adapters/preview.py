@@ -15,9 +15,12 @@ import httpx
 
 from app.wishlist.domain.errors import ValidationError
 
-_MAX_BYTES = 1_048_576  # 1 MiB
+_MAX_BYTES = 512_000  # hard cap — product meta is almost always in the first chunk / <head>
 _DEFAULT_TIMEOUT = 8.0
 _MAX_REDIRECTS = 3
+_HEAD_END = re.compile(rb"</head\s*>", re.IGNORECASE)
+# Keep a little body after </head> for stores that put JSON-LD just below it.
+_POST_HEAD_SLACK = 64_000
 
 _META_PROP = re.compile(
     r'<meta[^>]+(?:property|name)\s*=\s*["\']([^"\']+)["\'][^>]+content\s*=\s*["\']([^"\']*)["\']',
@@ -59,8 +62,30 @@ def _timeout_s() -> float:
 def _user_agent() -> str:
     return os.getenv(
         "WISHLIST_PREVIEW_USER_AGENT",
-        "WishlistPreviewBot/1.0 (+https://wishlist.local; product-preview)",
+        (
+            "Mozilla/5.0 (compatible; WishlistPreviewBot/1.1; "
+            "+https://wishlist.local; product-metadata-preview)"
+        ),
     ).strip()
+
+
+def _draft_has_signal(draft: Dict[str, Any]) -> bool:
+    return bool(
+        draft.get("title") or draft.get("image_url") or draft.get("price") is not None
+    )
+
+
+def _read_enough_html(buf: bytearray) -> bool:
+    """
+    Stop streaming once </head> is seen (+ small slack), or hard cap is hit.
+    Large storefronts (Shopify etc.) often exceed 1MB; OG/JSON-LD live in <head>.
+    """
+    if len(buf) >= _MAX_BYTES:
+        return True
+    m = _HEAD_END.search(buf)
+    if not m:
+        return False
+    return len(buf) >= m.end() + _POST_HEAD_SLACK
 
 
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -274,6 +299,8 @@ class HttpScrapePreview:
             "User-Agent": _user_agent(),
             "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.8",
+            # Prefer identity so early-exit byte counts match uncompressed HTML.
+            "Accept-Encoding": "identity",
         }
 
         async with httpx.AsyncClient(
@@ -301,29 +328,29 @@ class HttpScrapePreview:
 
                         ctype = (resp.headers.get("content-type") or "").lower()
                         if "html" not in ctype and "xml" not in ctype and ctype:
-                            # Some stores return text/html without charset; allow empty
                             if not ctype.startswith("text/"):
                                 raise ValidationError("url did not return HTML")
 
-                        chunks: List[bytes] = []
-                        total = 0
+                        buf = bytearray()
                         async for chunk in resp.aiter_bytes():
-                            total += len(chunk)
-                            if total > _MAX_BYTES:
-                                raise ValidationError("page is too large to preview")
-                            chunks.append(chunk)
-                        body = b"".join(chunks)
+                            if not chunk:
+                                continue
+                            buf.extend(chunk)
+                            if _read_enough_html(buf):
+                                # Drop the connection early — do not download the full page.
+                                break
+                        body = bytes(buf)
                 except httpx.TimeoutException as e:
                     raise ValidationError("preview timed out; enter details manually") from e
                 except httpx.HTTPError as e:
                     raise ValidationError("could not fetch url; enter details manually") from e
 
-                # Successful body fetch
+                if not body:
+                    raise ValidationError("empty response; enter details manually")
+
                 text = body.decode("utf-8", errors="replace")
                 draft = parse_product_html(text, current)
-                if not any(
-                    [draft.get("title"), draft.get("image_url"), draft.get("price") is not None]
-                ):
+                if not _draft_has_signal(draft):
                     raise ValidationError(
                         "could not extract product details; enter title, image, and price manually"
                     )
