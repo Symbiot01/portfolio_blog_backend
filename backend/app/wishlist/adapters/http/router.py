@@ -31,6 +31,8 @@ from app.wishlist.adapters.http.schemas import (
     PurchaseResponse,
     ReserveRequest,
     ReserveResponse,
+    UrlPreviewIn,
+    UrlPreviewOut,
 )
 from app.wishlist.domain.actor import MemberActor
 from app.wishlist.domain.errors import (
@@ -359,6 +361,26 @@ async def revoke_link(
     except WishlistError as e:
         raise _http_from_domain(e)
     return Response(status_code=204)
+
+
+@router.post("/{group_id}/preview-url", response_model=UrlPreviewOut)
+@limiter.limit("10/minute")
+async def preview_product_url(
+    group_id: str,
+    payload: UrlPreviewIn,
+    request: Request,
+    ctx: ActorContext = Depends(resolve_wishlist_actor),
+    container: Container = Depends(get_wishlist_container),
+):
+    """
+    Extract draft store-option fields (title, image, price) from a public product URL.
+    Does not persist anything — client confirms via create/update product.
+    """
+    try:
+        draft = await container.preview_product_url(group_id=group_id, url=payload.url)
+    except WishlistError as e:
+        raise _http_from_domain(e)
+    return UrlPreviewOut(**draft)
 
 
 # --- Products ---

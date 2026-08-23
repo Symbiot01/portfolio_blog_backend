@@ -131,3 +131,17 @@ class LinkInfo(BaseModel):
     secret_access_url: str
     link_revoked: bool
     access_token: UUID
+
+
+class UrlPreviewIn(BaseModel):
+    url: str = Field(..., max_length=2000)
+
+
+class UrlPreviewOut(BaseModel):
+    title: Optional[str] = None
+    url: str
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    image_url: Optional[str] = None
+    notes: Optional[str] = None
+    source: Optional[str] = None
