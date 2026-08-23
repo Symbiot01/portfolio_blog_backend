@@ -145,5 +145,7 @@ class UrlPreviewOut(BaseModel):
     price: Optional[float] = None
     currency: Optional[str] = None
     image_url: Optional[str] = None
+    # When scrape/AI cannot trust a single image, client shows these for user pick.
+    image_candidates: List[str] = Field(default_factory=list)
     notes: Optional[str] = None
     source: Optional[str] = None
