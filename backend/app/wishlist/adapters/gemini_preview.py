@@ -5,16 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
 
-from app.wishlist.adapters.preview import (
-    _draft_has_signal,
-    _parse_price,
-    assert_safe_public_url,
-)
+from app.wishlist.adapters.image_search import image_search_enabled, search_product_images
+from app.wishlist.adapters.preview import assert_safe_public_url
 from app.wishlist.domain.errors import ValidationError
 
 _ASIN_RE = re.compile(r"(?:/dp/|/gp/product/|/product/)([A-Z0-9]{10})", re.I)
@@ -55,142 +52,136 @@ def _extract_asin(url: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 
-def _sanitize_draft(raw: Dict[str, Any], page_url: str) -> Dict[str, Any]:
-    title = raw.get("title")
-    if title is not None:
-        title = str(title).strip()[:150] or None
+async def _gemini_title_and_query(page_url: str) -> Dict[str, Optional[str]]:
+    """
+    Ask Gemini only for a product title + image search query.
+    Never trust model-invented prices or single image URLs.
+    """
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    asin = _extract_asin(page_url)
+    host = (urlparse(page_url).hostname or "").lower()
 
-    image_url = raw.get("image_url") or raw.get("image")
-    if image_url:
-        image_url = str(image_url).strip()[:2000]
-        try:
-            image_url = assert_safe_public_url(image_url)
-        except ValidationError:
-            image_url = None
-    else:
-        image_url = None
-
-    price = _parse_price(raw.get("price"))
-    currency = raw.get("currency")
-    if currency:
-        currency = str(currency).strip().upper()[:8] or None
-
-    notes = raw.get("notes")
-    if notes is not None:
-        notes = str(notes).strip()[:500] or None
-
-    draft = {
-        "title": title,
+    prompt = {
+        "task": (
+            "Identify the product at this shopping URL. "
+            "Return ONLY JSON with keys: title, search_query. "
+            "title = concise product name (max 120 chars) or null if unknown. "
+            "search_query = short Google image search query (brand + product + color/size) "
+            "to find photos of THIS product, or null. "
+            "Do NOT invent a price. Do NOT invent image URLs."
+        ),
         "url": page_url,
-        "price": price,
-        "currency": currency,
-        "image_url": image_url,
-        "notes": notes,
-        "source": "gemini",
+        "host": host,
+        "asin": asin,
     }
-    if not _draft_has_signal(draft):
-        raise ValidationError(
-            "AI preview returned no usable product fields; enter details manually"
+
+    model = _gemini_model()
+    endpoint = _GEMINI_URL.format(model=model)
+    payload: Dict[str, Any] = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": json.dumps(prompt, ensure_ascii=False)}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        },
+        "tools": [{"google_search": {}}],
+    }
+
+    async with httpx.AsyncClient(timeout=_gemini_timeout_s()) as client:
+        resp = await client.post(
+            endpoint,
+            params={"key": api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
         )
-    return draft
+        if resp.status_code in {400, 404} and "tools" in payload:
+            payload.pop("tools", None)
+            resp = await client.post(
+                endpoint,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json=payload,
+            )
+
+    if resp.status_code >= 400:
+        raise ValidationError(
+            f"AI preview failed (HTTP {resp.status_code}); enter details manually"
+        )
+
+    data = resp.json()
+    parts = data["candidates"][0]["content"]["parts"]
+    text_bits = [p.get("text", "") for p in parts if isinstance(p, dict)]
+    content = "\n".join(t for t in text_bits if t).strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*", "", content)
+        content = re.sub(r"\s*```$", "", content)
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict):
+        raise ValueError("not an object")
+
+    title = parsed.get("title")
+    title = str(title).strip()[:150] if title else None
+    search_query = parsed.get("search_query")
+    search_query = str(search_query).strip()[:200] if search_query else None
+    return {"title": title or None, "search_query": search_query or None}
 
 
 class GeminiPreview:
     """
-    Use Gemini (+ Google Search / URL context when available) to recover product
-    metadata after HTTP scrape fails (common for Amazon share links).
-    Requires GEMINI_API_KEY. Key stays server-side only.
+    AI-assisted preview after scrape fails:
+    - title from Gemini (+ Google Search grounding)
+    - NEVER auto-fill price (models invent prices)
+    - NEVER auto-pick a single image_url
+    - up to 10 real image candidates from Google image search (CSE/Serper)
     """
 
     async def from_url(self, url: str) -> Dict[str, Any]:
-        api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-        if not api_key:
+        if not (os.getenv("GEMINI_API_KEY") or "").strip():
             raise ValidationError("AI preview is not configured")
 
         page_url = assert_safe_public_url(url)
-        asin = _extract_asin(page_url)
-        host = (urlparse(page_url).hostname or "").lower()
-
-        prompt = {
-            "task": (
-                "Extract product listing fields for a wishlist draft from this URL. "
-                "Use web/search knowledge if the page blocks scrapers. "
-                "Return ONLY JSON with keys: title, price, currency, image_url, notes. "
-                "price must be a number or null. currency like INR/USD or null. "
-                "image_url must be a direct https image URL or null. "
-                "If unsure, use nulls — do not invent a price."
-            ),
-            "url": page_url,
-            "host": host,
-            "asin": asin,
-        }
-
-        model = _gemini_model()
-        endpoint = _GEMINI_URL.format(model=model)
-        payload: Dict[str, Any] = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": json.dumps(prompt, ensure_ascii=False)}],
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "responseMimeType": "application/json",
-            },
-            # Let Gemini resolve product pages / short links that block our scraper.
-            "tools": [{"google_search": {}}],
-        }
-
         try:
-            async with httpx.AsyncClient(timeout=_gemini_timeout_s()) as client:
-                resp = await client.post(
-                    endpoint,
-                    params={"key": api_key},
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                )
+            meta = await _gemini_title_and_query(page_url)
+        except ValidationError:
+            raise
         except httpx.TimeoutException as e:
             raise ValidationError("AI preview timed out; enter details manually") from e
-        except httpx.HTTPError as e:
-            raise ValidationError("AI preview failed; enter details manually") from e
-
-        if resp.status_code >= 400:
-            # Retry once without tools if the model rejects google_search.
-            if resp.status_code in {400, 404} and "tools" in payload:
-                payload.pop("tools", None)
-                try:
-                    async with httpx.AsyncClient(timeout=_gemini_timeout_s()) as client:
-                        resp = await client.post(
-                            endpoint,
-                            params={"key": api_key},
-                            headers={"Content-Type": "application/json"},
-                            json=payload,
-                        )
-                except httpx.HTTPError as e:
-                    raise ValidationError("AI preview failed; enter details manually") from e
-            if resp.status_code >= 400:
-                raise ValidationError(
-                    f"AI preview failed (HTTP {resp.status_code}); enter details manually"
-                )
-
-        try:
-            data = resp.json()
-            parts = data["candidates"][0]["content"]["parts"]
-            text_bits = [p.get("text", "") for p in parts if isinstance(p, dict)]
-            content = "\n".join(t for t in text_bits if t).strip()
-            if not content:
-                raise KeyError("empty")
-            # Models sometimes wrap JSON in fences.
-            if content.startswith("```"):
-                content = re.sub(r"^```(?:json)?\s*", "", content)
-                content = re.sub(r"\s*```$", "", content)
-            parsed = json.loads(content)
-            if not isinstance(parsed, dict):
-                raise ValueError("not an object")
         except Exception as e:
             raise ValidationError(
                 "AI preview returned unusable data; enter details manually"
             ) from e
 
-        return _sanitize_draft(parsed, page_url)
+        title = meta.get("title")
+        query = meta.get("search_query") or title
+        if not query:
+            host = urlparse(page_url).hostname or ""
+            query = f"product {host}".strip()
+
+        candidates: List[str] = []
+        if image_search_enabled() and query:
+            candidates = await search_product_images(query, limit=10)
+
+        draft: Dict[str, Any] = {
+            "title": title,
+            "url": page_url,
+            # Price is scrape-only — AI invents bad numbers.
+            "price": None,
+            "currency": None,
+            "image_url": None,
+            "image_candidates": candidates,
+            "notes": (
+                "Price not auto-filled (AI). Pick an image below or enter details manually."
+                if candidates
+                else "Could not find image candidates; enter title/price/photo manually."
+            ),
+            "source": "gemini+images" if candidates else "gemini",
+        }
+        if not title and not candidates:
+            raise ValidationError(
+                "AI preview found no title or images; enter details manually"
+            )
+        return draft
