@@ -11,6 +11,7 @@ from app.models.settlement import Settlement
 from app.models.trip_doc import TripDoc
 from app.models.trip_audit import TripAuditEvent
 from app.models.trip_edit_nonce import TripEditNonce
+from app.wishlist.adapters.db.documents import WISHLIST_DOCUMENT_MODELS
 
 _client = None
 
@@ -40,6 +41,7 @@ async def initialize_database():
             TripDoc,
             TripAuditEvent,
             TripEditNonce,
+            *WISHLIST_DOCUMENT_MODELS,
         ]
     )
 
