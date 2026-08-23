@@ -12,7 +12,7 @@ from app.wishlist.adapters.db.repositories import (
     MongoPurchaseRepo,
     MongoReservationRepo,
 )
-from app.wishlist.adapters.preview import NullPreview
+from app.wishlist.adapters.preview import build_preview_adapter
 from app.wishlist.adapters.tokens import UuidTokenGen
 from app.wishlist.application.groups import (
     CreateGroup,
@@ -27,6 +27,7 @@ from app.wishlist.application.groups import (
     UpdateGroup,
 )
 from app.wishlist.application.members import AddMemberSlot, LinkSelf, RemoveMemberSlot, UnlinkMember
+from app.wishlist.application.preview import PreviewProductUrl
 from app.wishlist.application.products import AddProduct, DeleteProduct, UpdateProduct
 from app.wishlist.application.reservations import (
     PurchaseReservation,
@@ -40,7 +41,7 @@ class Container:
     def __init__(self) -> None:
         clock = UtcClock()
         tokens = UuidTokenGen()
-        preview = NullPreview()
+        preview = build_preview_adapter()
         audit = BestEffortAuditSink()
 
         groups = MongoGroupRepo()
@@ -126,6 +127,7 @@ class Container:
         self.list_products_view = ListProductsView(
             groups=groups, products=products, reservations=reservations
         )
+        self.preview_product_url = PreviewProductUrl(groups=groups, preview=preview)
 
 
 _container: Optional[Container] = None
