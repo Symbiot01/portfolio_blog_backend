@@ -202,6 +202,27 @@ async def link_self_member(
         ],
     )
 
+@router.delete("/{trip_id}/members/{member_id}", response_model=TripRead)
+@limiter.limit("30/minute")
+async def remove_member(
+    trip_id: PydanticObjectId,
+    member_id: str,
+    actor = Depends(resolve_trip_actor("trip_id")),
+    request: Request = None,
+):
+    _require_quicklink_edit(actor)
+    trip = await TripService.remove_member(actor["trip"], member_id=member_id)
+    await record_audit(request, actor, "member.delete", {"member_id": member_id})
+    return TripRead(
+        id=trip.id,
+        name=trip.name,
+        description=trip.description,
+        members=[
+            TripMemberInfo(member_id=str(m.member_id), display_name=m.display_name, linked=bool(m.user))
+            for m in trip.members
+        ],
+    )
+
 
 # --- Itinerary CRUD ---
 
@@ -396,7 +417,7 @@ async def update_expense(
     merged_split_with = update_data.get("split_with_member_ids", getattr(exp, "split_with_member_ids", []))
     merged_custom_splits = update_data.get("custom_splits", getattr(exp, "custom_splits", []))
 
-    TripService._validate_expense(
+    deduped_split_with = TripService._validate_expense(
         trip=actor["trip"],
         amount=merged_amount,
         paid_by_member_id=merged_paid_by,
@@ -404,6 +425,8 @@ async def update_expense(
         split_with_member_ids=merged_split_with,
         custom_splits=merged_custom_splits,
     )
+    if "split_with_member_ids" in update_data:
+        update_data["split_with_member_ids"] = deduped_split_with
 
     for k, v in update_data.items():
         setattr(exp, k, v)
