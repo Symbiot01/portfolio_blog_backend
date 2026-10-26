@@ -369,6 +369,9 @@ async def get_expense(
         "split_with_member_ids": exp.split_with_member_ids,
         "split_type": getattr(exp, "split_type", "equal"),
         "custom_splits": getattr(exp, "custom_splits", []),
+        "category": getattr(exp, "category", "Other") or "Other",
+        "date": getattr(exp, "date", None),
+        "created_at": getattr(exp, "createdAt", None),
     }
 
 @router.patch("/{trip_id}/expenses/{expense_id}")
@@ -382,29 +385,25 @@ async def update_expense(
 ):
     _require_quicklink_edit(actor)
     from app.models.expense import Expense
-    import math
     exp = await Expense.get(expense_id)
     if not exp or str(exp.trip.ref.id) != str(actor["trip"].id):
         raise HTTPException(status_code=404, detail="Expense not found")
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
 
+    merged_amount = update_data.get("amount", exp.amount)
+    merged_paid_by = update_data.get("paid_by_member_id", exp.paid_by_member_id)
     merged_split_type = update_data.get("split_type", getattr(exp, "split_type", "equal"))
-    if merged_split_type == "exact":
-        merged_amount = update_data.get("amount", exp.amount)
-        merged_custom_splits = update_data.get("custom_splits", getattr(exp, "custom_splits", []))
-        
-        if not merged_custom_splits:
-            raise HTTPException(status_code=400, detail="custom_splits must be provided for exact split type")
-            
-        total_custom_amount = sum(cs["amount"] if isinstance(cs, dict) else getattr(cs, "amount", 0.0) for cs in merged_custom_splits)
-        if not math.isclose(total_custom_amount, merged_amount, rel_tol=1e-9, abs_tol=0.01):
-            raise HTTPException(status_code=400, detail="Sum of custom splits must equal the total amount")
-            
-        member_ids = {str(m.member_id) for m in actor["trip"].members}
-        for cs in merged_custom_splits:
-            m_id = cs["member_id"] if isinstance(cs, dict) else getattr(cs, "member_id", "")
-            if m_id not in member_ids:
-                raise HTTPException(status_code=400, detail=f"Member {m_id} is not part of this trip")
+    merged_split_with = update_data.get("split_with_member_ids", getattr(exp, "split_with_member_ids", []))
+    merged_custom_splits = update_data.get("custom_splits", getattr(exp, "custom_splits", []))
+
+    TripService._validate_expense(
+        trip=actor["trip"],
+        amount=merged_amount,
+        paid_by_member_id=merged_paid_by,
+        split_type=merged_split_type,
+        split_with_member_ids=merged_split_with,
+        custom_splits=merged_custom_splits,
+    )
 
     for k, v in update_data.items():
         setattr(exp, k, v)
@@ -460,6 +459,7 @@ async def get_settlement(
         "payee_member_id": s.payee_member_id,
         "amount": s.amount,
         "mode": s.mode,
+        "created_at": getattr(s, "createdAt", None),
     }
 
 @router.patch("/{trip_id}/settlements/{settlement_id}")
@@ -1065,7 +1065,7 @@ async def list_expenses(
     actor = Depends(resolve_trip_actor("trip_id")),
 ):
     from app.models.expense import Expense as ExpModel
-    exps = await ExpModel.find(ExpModel.trip.id == actor["trip"].id).to_list()
+    exps = await ExpModel.find(ExpModel.trip.id == actor["trip"].id).sort("-createdAt").to_list()
     return [
         ExpenseRead(
             id=e.id,
@@ -1075,6 +1075,9 @@ async def list_expenses(
             split_with_member_ids=e.split_with_member_ids,
             split_type=getattr(e, "split_type", "equal"),
             custom_splits=getattr(e, "custom_splits", []),
+            category=getattr(e, "category", "Other") or "Other",
+            date=getattr(e, "date", None),
+            created_at=getattr(e, "createdAt", None),
         )
         for e in exps
     ]
@@ -1085,7 +1088,7 @@ async def list_settlements(
     actor = Depends(resolve_trip_actor("trip_id")),
 ):
     from app.models.settlement import Settlement as SetModel
-    sts = await SetModel.find(SetModel.trip.id == actor["trip"].id).to_list()
+    sts = await SetModel.find(SetModel.trip.id == actor["trip"].id).sort("-createdAt").to_list()
     return [
         SettlementRead(
             id=s.id,
@@ -1093,6 +1096,7 @@ async def list_settlements(
             payee_member_id=s.payee_member_id,
             amount=s.amount,
             mode=s.mode,
+            created_at=getattr(s, "createdAt", None),
         )
         for s in sts
     ]

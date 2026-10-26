@@ -52,11 +52,13 @@ class CustomSplit(BaseModel):
 
 class ExpenseCreate(BaseModel):
     description: str = Field(..., max_length=150)
-    amount: float
+    amount: float = Field(..., gt=0)
     paid_by_member_id: str
     split_with_member_ids: Optional[List[str]] = Field(default_factory=list)
     split_type: Literal["equal", "exact"] = "equal"
     custom_splits: Optional[List[CustomSplit]] = Field(default_factory=list)
+    category: Optional[str] = Field(default="Other", max_length=64)
+    date: Optional[str] = Field(default=None, max_length=64)
 
 class ExpenseRead(BaseModel):
     id: PydanticObjectId
@@ -66,6 +68,9 @@ class ExpenseRead(BaseModel):
     split_with_member_ids: List[str]
     split_type: Literal["equal", "exact"]
     custom_splits: List[CustomSplit]
+    category: Optional[str] = "Other"
+    date: Optional[str] = None
+    created_at: Optional[datetime] = None
 
 class ItineraryItemUpdate(BaseModel):
     title: Optional[str] = None
@@ -81,12 +86,14 @@ class ItineraryItemUpdate(BaseModel):
     lng: Optional[float] = Field(default=None, ge=-180, le=180)
 
 class ExpenseUpdate(BaseModel):
-    description: Optional[str] = None
-    amount: Optional[float] = None
+    description: Optional[str] = Field(default=None, max_length=150)
+    amount: Optional[float] = Field(default=None, gt=0)
     paid_by_member_id: Optional[str] = None
     split_with_member_ids: Optional[List[str]] = None
     split_type: Optional[Literal["equal", "exact"]] = None
     custom_splits: Optional[List[CustomSplit]] = None
+    category: Optional[str] = Field(default=None, max_length=64)
+    date: Optional[str] = Field(default=None, max_length=64)
 
 class SettlementCreate(BaseModel):
     payer_member_id: str
@@ -100,6 +107,7 @@ class SettlementRead(BaseModel):
     payee_member_id: str
     amount: float
     mode: Literal["cash", "upi", "card"]
+    created_at: Optional[datetime] = None
 
 class SettlementUpdate(BaseModel):
     payer_member_id: Optional[str] = None
