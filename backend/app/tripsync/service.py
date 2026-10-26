@@ -83,7 +83,7 @@ class TripService:
         split_type: str,
         split_with_member_ids: Optional[list[str]],
         custom_splits: Optional[list],
-    ) -> None:
+    ) -> list[str]:
         if not math.isfinite(amount) or amount <= 0:
             raise HTTPException(status_code=400, detail="Expense amount must be a finite positive number")
 
@@ -91,16 +91,22 @@ class TripService:
         if paid_by_member_id not in member_ids:
             raise HTTPException(status_code=400, detail="paid_by_member_id is not a member of this trip")
 
+        deduped_split_with = list(dict.fromkeys(str(m_id) for m_id in (split_with_member_ids or [])))
+
         if split_type == "exact":
             if not custom_splits:
                 raise HTTPException(status_code=400, detail="custom_splits must be provided for exact split type")
 
             total_custom_amount = 0.0
+            seen_custom_members: set[str] = set()
             for cs in custom_splits:
-                m_id = cs["member_id"] if isinstance(cs, dict) else getattr(cs, "member_id", "")
+                m_id = str(cs["member_id"] if isinstance(cs, dict) else getattr(cs, "member_id", ""))
                 cs_amt = cs["amount"] if isinstance(cs, dict) else getattr(cs, "amount", 0.0)
                 if m_id not in member_ids:
                     raise HTTPException(status_code=400, detail=f"Member {m_id} is not part of this trip")
+                if m_id in seen_custom_members:
+                    raise HTTPException(status_code=400, detail=f"Duplicate member_id {m_id} in custom_splits")
+                seen_custom_members.add(m_id)
                 if not math.isfinite(cs_amt) or cs_amt < 0:
                     raise HTTPException(status_code=400, detail="Custom split amounts must be finite non-negative numbers")
                 total_custom_amount += cs_amt
@@ -108,15 +114,17 @@ class TripService:
             if not math.isclose(total_custom_amount, amount, rel_tol=1e-9, abs_tol=0.01):
                 raise HTTPException(status_code=400, detail="Sum of custom splits must equal the total amount")
         else:
-            if not split_with_member_ids:
+            if not deduped_split_with:
                 raise HTTPException(status_code=400, detail="At least one member must be selected for equal split")
-            for m_id in split_with_member_ids:
+            for m_id in deduped_split_with:
                 if m_id not in member_ids:
                     raise HTTPException(status_code=400, detail=f"Member {m_id} is not part of this trip")
 
+        return deduped_split_with
+
     @staticmethod
     async def add_expense(trip: Trip, data: ExpenseCreate, paid_by_user: Optional[User]) -> Expense:
-        TripService._validate_expense(
+        deduped_split_with = TripService._validate_expense(
             trip=trip,
             amount=data.amount,
             paid_by_member_id=data.paid_by_member_id,
@@ -130,7 +138,7 @@ class TripService:
             description=data.description,
             amount=data.amount,
             paid_by_member_id=data.paid_by_member_id,
-            split_with_member_ids=data.split_with_member_ids or [],
+            split_with_member_ids=deduped_split_with,
             split_type=data.split_type,
             custom_splits=[cs.model_dump() if hasattr(cs, "model_dump") else cs.dict() for cs in data.custom_splits] if data.custom_splits else [],
             category=(data.category or "Other").strip() or "Other",
@@ -151,42 +159,117 @@ class TripService:
         return await settlement.insert()
 
     @staticmethod
-    async def compute_balances(trip: Trip) -> list[BalanceEntry]:
-        member_ids = [str(m.member_id) for m in trip.members]
-        balance_map = {mid: 0.0 for mid in member_ids}
-
-        # Expenses
-        expenses = await Expense.find(Expense.trip.id == trip.id).to_list()
+    def _is_member_referenced(
+        member_id: str,
+        expenses: list,
+        settlements: list,
+    ) -> bool:
+        target = str(member_id)
         for e in expenses:
-            # Payer gets credited full amount initially
-            balance_map[e.paid_by_member_id] = balance_map.get(e.paid_by_member_id, 0.0) + e.amount
+            if str(getattr(e, "paid_by_member_id", "")) == target:
+                return True
+            if any(str(mid) == target for mid in (getattr(e, "split_with_member_ids", None) or [])):
+                return True
+            for cs in getattr(e, "custom_splits", None) or []:
+                cs_mid = cs.get("member_id") if isinstance(cs, dict) else getattr(cs, "member_id", "")
+                if str(cs_mid) == target:
+                    return True
+
+        for s in settlements:
+            if str(getattr(s, "payer_member_id", "")) == target or str(getattr(s, "payee_member_id", "")) == target:
+                return True
+
+        return False
+
+    @staticmethod
+    def _validate_member_removal(
+        trip: Trip,
+        member_id: str,
+        expenses: list,
+        settlements: list,
+    ) -> None:
+        target = str(member_id)
+        existing = next((m for m in trip.members if str(m.member_id) == target), None)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Member not found in this trip")
+        if len(trip.members) <= 1:
+            raise HTTPException(status_code=400, detail="Cannot remove the last remaining member of a trip")
+        if TripService._is_member_referenced(target, expenses, settlements):
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot remove member who is referenced in existing expenses or settlements",
+            )
+
+    @staticmethod
+    async def remove_member(trip: Trip, member_id: str) -> Trip:
+        expenses = await Expense.find(Expense.trip.id == trip.id).to_list()
+        settlements = await Settlement.find(Settlement.trip.id == trip.id).to_list()
+        TripService._validate_member_removal(trip, member_id, expenses, settlements)
+        target = str(member_id)
+        trip.members = [m for m in trip.members if str(m.member_id) != target]
+        await trip.save()
+        return trip
+
+    @staticmethod
+    def _compute_balances_from_records(
+        trip: Trip,
+        expenses: list,
+        settlements: list,
+    ) -> list[BalanceEntry]:
+        member_names = {str(m.member_id): m.display_name for m in trip.members}
+        balance_map = {mid: 0.0 for mid in member_names}
+
+        for e in expenses:
+            payer_id = str(e.paid_by_member_id)
+            balance_map[payer_id] = balance_map.get(payer_id, 0.0) + e.amount
 
             split_type = getattr(e, "split_type", "equal")
 
             if split_type == "exact":
-                custom_splits = getattr(e, "custom_splits", [])
+                custom_splits = getattr(e, "custom_splits", []) or []
+                seen_custom: set[str] = set()
                 for cs in custom_splits:
                     member_id = cs.get("member_id") if isinstance(cs, dict) else getattr(cs, "member_id", None)
                     amount = cs.get("amount") if isinstance(cs, dict) else getattr(cs, "amount", 0.0)
                     if member_id:
-                        balance_map[member_id] = balance_map.get(member_id, 0.0) - amount
+                        mid_str = str(member_id)
+                        if mid_str in seen_custom:
+                            continue
+                        seen_custom.add(mid_str)
+                        balance_map[mid_str] = balance_map.get(mid_str, 0.0) - amount
             else:
-                if not e.split_with_member_ids:
+                unique_participants = list(
+                    dict.fromkeys(str(mid) for mid in (e.split_with_member_ids or []) if mid)
+                )
+                if not unique_participants:
                     continue
-                share = e.amount / len(e.split_with_member_ids)
-                # Each participant owes their share
-                for mid in e.split_with_member_ids:
+                share = e.amount / len(unique_participants)
+                for mid in unique_participants:
                     balance_map[mid] = balance_map.get(mid, 0.0) - share
 
-        # Settlements: payer pays payee (see balance_math.apply_settlement for sign convention).
-        settlements = await Settlement.find(Settlement.trip.id == trip.id).to_list()
         for s in settlements:
-            # Be defensive in case legacy data contains bad values; don't break balances endpoint.
             try:
-                apply_settlement(balance_map, s.payer_member_id, s.payee_member_id, s.amount)
+                apply_settlement(balance_map, str(s.payer_member_id), str(s.payee_member_id), s.amount)
             except ValueError:
                 continue
 
-        return [BalanceEntry(member_id=mid, balance=round(bal, 2)) for mid, bal in balance_map.items()]
+        entries: list[BalanceEntry] = []
+        for mid, bal in balance_map.items():
+            rounded = round(bal, 2)
+            if mid in member_names or abs(rounded) > 0.0:
+                entries.append(
+                    BalanceEntry(
+                        member_id=mid,
+                        display_name=member_names.get(mid, "Former Member"),
+                        balance=rounded,
+                    )
+                )
+        return entries
+
+    @staticmethod
+    async def compute_balances(trip: Trip) -> list[BalanceEntry]:
+        expenses = await Expense.find(Expense.trip.id == trip.id).to_list()
+        settlements = await Settlement.find(Settlement.trip.id == trip.id).to_list()
+        return TripService._compute_balances_from_records(trip, expenses, settlements)
 
 

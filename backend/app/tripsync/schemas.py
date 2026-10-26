@@ -117,6 +117,7 @@ class SettlementUpdate(BaseModel):
 
 class BalanceEntry(BaseModel):
     member_id: str
+    display_name: Optional[str] = None
     balance: float  # positive means others owe them; negative means they owe
 
 class LinkExpiryUpdate(BaseModel):
