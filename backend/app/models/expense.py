@@ -19,6 +19,8 @@ class Expense(Document):
     split_with_member_ids: List[str] = []  # TripMember.member_id list
     split_type: Literal["equal", "exact"] = "equal"
     custom_splits: List[dict] = []  # Store as dictionaries
+    category: str = Field(default="Other", max_length=64)
+    date: Optional[str] = Field(default=None, max_length=64)
     createdAt: datetime = Field(default_factory=datetime.utcnow)
 
     class Settings:

@@ -76,28 +76,65 @@ class TripService:
         return await item.insert()
 
     @staticmethod
-    async def add_expense(trip: Trip, data: ExpenseCreate, paid_by_user: Optional[User]) -> Expense:
-        if data.split_type == "exact":
-            if not data.custom_splits:
+    def _validate_expense(
+        trip: Trip,
+        amount: float,
+        paid_by_member_id: str,
+        split_type: str,
+        split_with_member_ids: Optional[list[str]],
+        custom_splits: Optional[list],
+    ) -> None:
+        if not math.isfinite(amount) or amount <= 0:
+            raise HTTPException(status_code=400, detail="Expense amount must be a finite positive number")
+
+        member_ids = {str(m.member_id) for m in trip.members}
+        if paid_by_member_id not in member_ids:
+            raise HTTPException(status_code=400, detail="paid_by_member_id is not a member of this trip")
+
+        if split_type == "exact":
+            if not custom_splits:
                 raise HTTPException(status_code=400, detail="custom_splits must be provided for exact split type")
-            
-            total_custom_amount = sum(cs.amount for cs in data.custom_splits)
-            if not math.isclose(total_custom_amount, data.amount, rel_tol=1e-9, abs_tol=0.01):
+
+            total_custom_amount = 0.0
+            for cs in custom_splits:
+                m_id = cs["member_id"] if isinstance(cs, dict) else getattr(cs, "member_id", "")
+                cs_amt = cs["amount"] if isinstance(cs, dict) else getattr(cs, "amount", 0.0)
+                if m_id not in member_ids:
+                    raise HTTPException(status_code=400, detail=f"Member {m_id} is not part of this trip")
+                if not math.isfinite(cs_amt) or cs_amt < 0:
+                    raise HTTPException(status_code=400, detail="Custom split amounts must be finite non-negative numbers")
+                total_custom_amount += cs_amt
+
+            if not math.isclose(total_custom_amount, amount, rel_tol=1e-9, abs_tol=0.01):
                 raise HTTPException(status_code=400, detail="Sum of custom splits must equal the total amount")
-            
-            member_ids = {str(m.member_id) for m in trip.members}
-            for cs in data.custom_splits:
-                if cs.member_id not in member_ids:
-                    raise HTTPException(status_code=400, detail=f"Member {cs.member_id} is not part of this trip")
+        else:
+            if not split_with_member_ids:
+                raise HTTPException(status_code=400, detail="At least one member must be selected for equal split")
+            for m_id in split_with_member_ids:
+                if m_id not in member_ids:
+                    raise HTTPException(status_code=400, detail=f"Member {m_id} is not part of this trip")
+
+    @staticmethod
+    async def add_expense(trip: Trip, data: ExpenseCreate, paid_by_user: Optional[User]) -> Expense:
+        TripService._validate_expense(
+            trip=trip,
+            amount=data.amount,
+            paid_by_member_id=data.paid_by_member_id,
+            split_type=data.split_type,
+            split_with_member_ids=data.split_with_member_ids,
+            custom_splits=data.custom_splits,
+        )
 
         expense = Expense(
             trip=trip,
             description=data.description,
             amount=data.amount,
             paid_by_member_id=data.paid_by_member_id,
-            split_with_member_ids=data.split_with_member_ids,
+            split_with_member_ids=data.split_with_member_ids or [],
             split_type=data.split_type,
-            custom_splits=[cs.dict() for cs in data.custom_splits] if data.custom_splits else [],
+            custom_splits=[cs.model_dump() if hasattr(cs, "model_dump") else cs.dict() for cs in data.custom_splits] if data.custom_splits else [],
+            category=(data.category or "Other").strip() or "Other",
+            date=data.date,
         )
         return await expense.insert()
 
